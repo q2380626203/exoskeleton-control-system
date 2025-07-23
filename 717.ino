@@ -17,6 +17,7 @@
 // ==================== 必要的头文件 ===================
 #include <HardwareSerial.h>
 #include "rs01_motor.h"
+#include "gy25t_sensor.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include <BLEDevice.h>
@@ -42,7 +43,7 @@ struct AssistParameters {
 };
 
 AssistParameters assistParams = {
-    0.15f, 0.3f, 0.5f, 3.0f, 5.5f, 8.0f, 0.2f, true, 0.5f, 0.1f, false
+    0.3f, 0.6f, 0.8f, 3.0f, 5.5f, 8.0f, 0.2f, true, 0.5f, 0.1f, false
 };
 
 // ==================== 核心数据结构与状态机 ===================
@@ -77,6 +78,7 @@ TaskHandle_t uartReceiveParseTaskHandle = NULL;
 TaskHandle_t uartTransmitManagerTaskHandle = NULL;
 TaskHandle_t analysisTaskHandle = NULL;
 TaskHandle_t standstillDetectionTaskHandle = NULL;
+TaskHandle_t gyroUpdateTaskHandle = NULL;
 
 // 标志变量，用于主循环中处理BLE通信
 volatile bool shouldSendParams = false;
@@ -86,20 +88,39 @@ volatile bool shouldSendMotorData = false;
 volatile bool motorInitializationComplete = false;
 
 // 静止检测控制变量
-volatile bool analysisTaskPaused[2] = {false, false}; // 控制每个电机的分析任务是否暂停
-volatile uint32_t analysisPauseEndTime[2] = {0, 0};   // 暂停结束时间
+volatile uint8_t standstillDetectionCount[2] = {1, 1}; // 静止检测次数标记，默认为1
+volatile bool forceStandstillState[2] = {false, false}; // 强制静止状态标志
+volatile uint32_t forceStandstillEndTime[2] = {0, 0};   // 强制静止状态结束时间
+volatile bool torqueDecayActive[2] = {false, false};    // 力矩衰减激活标志
+volatile float torqueDecayStartValue[2] = {0.0f, 0.0f}; // 衰减开始时的力矩值
+volatile uint32_t torqueDecayStartTime[2] = {0, 0};     // 衰减开始时间
+
+// 平滑力矩变化相关变量
+volatile bool torqueTransitionActive[2] = {false, false};  // 力矩平滑过渡激活标志
+volatile float torqueTransitionStartValue[2] = {0.0f, 0.0f}; // 过渡开始时的力矩值
+volatile float torqueTransitionTargetValue[2] = {0.0f, 0.0f}; // 过渡目标力矩值
+volatile uint32_t torqueTransitionStartTime[2] = {0, 0};      // 过渡开始时间
+volatile const uint32_t TORQUE_TRANSITION_DURATION = 1000;    // 力矩过渡持续时间：800ms
+volatile const uint32_t FORCE_STANDSTILL_DURATION = 500;    // 强制静止持续时间：1秒
+volatile const uint32_t RECOVERY_WAIT_DURATION = 500;       // 恢复等待时间：200ms
+volatile const float TORQUE_CHANGE_THRESHOLD = 0.1f;        // 力矩变化阈值：0.5Nm
+volatile const int16_t EMERGENCY_MOTION_THRESHOLD = 300;     // 紧急运动检测阈值（陀螺仪）
+volatile const float EMERGENCY_POSITION_THRESHOLD = 0.9f;   // 紧急运动检测阈值（位置变化）
 
 // ==================== 函数声明 ===================
 void uartReceiveParseTask(void* parameter);
 void uartTransmitManagerTask(void* parameter);
 void analysisTask(void* parameter);
 void standstillDetectionTask(void* parameter);
+void gyroUpdateTask(void* parameter);
 void analyzeActivityAndSetTorque(MotorChannel& channel);
 void motorDataCallback(MI_Motor* updated_motor);
 void sendMotorData();
 void sendConnectConfirmation();
 void sendAllData();
 void restartBLE();
+void startTorqueTransition(int motorIndex, float targetTorque);
+float getSmoothTorque(int motorIndex, float currentTorque);
 
 // ==================== BLE (蓝牙低功耗) 配置 ===================
 // 使用标准的UUID，增加兼容性
@@ -397,12 +418,16 @@ void setup() {
     motor1DataReceivedSemaphore = xSemaphoreCreateBinary();
     motor2DataReceivedSemaphore = xSemaphoreCreateBinary();
     UART_Rx_Init(motorDataCallback);
+    
+    // 初始化GY25T陀螺仪
+    gy25t_init();
 
-    // 首先创建UART和分析任务
-    xTaskCreatePinnedToCore(uartReceiveParseTask, "UartReceiveTask", 8192, NULL, 5, &uartReceiveParseTaskHandle, 1);
-    xTaskCreatePinnedToCore(uartTransmitManagerTask, "UartTransmitTask", 8192, NULL, 4, &uartTransmitManagerTaskHandle, 1);
-    xTaskCreatePinnedToCore(analysisTask, "AnalysisTask", 8192, NULL, 2, &analysisTaskHandle, 0);
-    xTaskCreatePinnedToCore(standstillDetectionTask, "StandstillDetectionTask", 4096, NULL, 1, &standstillDetectionTaskHandle, 0);
+    // 首先创建UART和分析任务（提高电机通信任务优先级）
+    xTaskCreatePinnedToCore(uartReceiveParseTask, "UartReceiveTask", 8192, NULL, 7, &uartReceiveParseTaskHandle, 1);  // 提高到7
+    xTaskCreatePinnedToCore(uartTransmitManagerTask, "UartTransmitTask", 8192, NULL, 6, &uartTransmitManagerTaskHandle, 1);  // 提高到6
+    xTaskCreatePinnedToCore(gyroUpdateTask, "GyroUpdateTask", 4096, NULL, 4, &gyroUpdateTaskHandle, 0);  // 提高到4
+    xTaskCreatePinnedToCore(analysisTask, "AnalysisTask", 8192, NULL, 3, &analysisTaskHandle, 0);  // 提高到3
+    xTaskCreatePinnedToCore(standstillDetectionTask, "StandstillDetectionTask", 4096, NULL, 2, &standstillDetectionTaskHandle, 0);  // 提高到2
     Serial.println("所有FreeRTOS任务已创建.");
     
     // 初始化电机模式为电流模式
@@ -634,6 +659,10 @@ void uartTransmitManagerTask(void* parameter) {
     uint8_t next_motor_to_poll = MOTER_1_ID;
     const uint32_t INTERMITTENT_CYCLE_MS = 50;
     
+    // 超时打印控制变量
+    static unsigned long lastTimeoutPrintTime[2] = {0, 0}; // 分别为电机1和电机2
+    static const unsigned long TIMEOUT_PRINT_INTERVAL = 5000; // 5秒间隔
+    
     // 等待电机初始化完成
     while (!motorInitializationComplete) {
         Serial.println("等待电机模式初始化完成...");
@@ -717,48 +746,133 @@ void uartTransmitManagerTask(void* parameter) {
         // 发送最终计算出的力矩指令，这是获取电机数据的关键
         Set_CurMode(motor_to_poll, applied_torque);
 
-        if (xSemaphoreTake(semaphore_to_wait_for, pdMS_TO_TICKS(150)) != pdTRUE) {
-            Serial.printf("电机 %d 响应超时.\n", next_motor_to_poll);
+        if (xSemaphoreTake(semaphore_to_wait_for, pdMS_TO_TICKS(300)) != pdTRUE) {  // 增加超时时间到300ms
+            // 控制超时打印频率为5秒一次
+            unsigned long currentTime = millis();
+            int motorIndex = (next_motor_to_poll == MOTER_1_ID) ? 0 : 1;
+            
+            if (currentTime - lastTimeoutPrintTime[motorIndex] >= TIMEOUT_PRINT_INTERVAL) {
+                Serial.printf("电机 %d 响应超时.\n", next_motor_to_poll);
+                lastTimeoutPrintTime[motorIndex] = currentTime;
+            }
         }
         next_motor_to_poll = (next_motor_to_poll == MOTER_1_ID) ? MOTER_2_ID : MOTER_1_ID;
+        
+        // 添加小的延时，避免过度占用CPU
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
 void standstillDetectionTask(void* parameter) {
     TickType_t lastWakeTime = xTaskGetTickCount();
-    const TickType_t frequency = pdMS_TO_TICKS(2000); // 每2秒检查一次
+    const TickType_t frequency = pdMS_TO_TICKS(500); // 每0.5秒检查一次，提高响应速度
     
     for (;;) {
-        for (int i = 0; i < 2; i++) {
-            MotorChannel& channel = motorChannels[i];
+        // 检查陀螺仪数据有效性
+        if (!g_gyroData.dataValid) {
+            // 如果陀螺仪数据无效，回退到原来的电机位置检测逻辑
+            for (int i = 0; i < 2; i++) {
+                MotorChannel& channel = motorChannels[i];
+                
+                float min_position = channel.activityBuffer[0].position;
+                float max_position = channel.activityBuffer[0].position;
+                
+                for (int j = 0; j < ACTIVITY_BUFFER_SIZE; j++) {
+                    float pos = channel.activityBuffer[j].position;
+                    if (pos < min_position) min_position = pos;
+                    if (pos > max_position) max_position = pos;
+                }
+                
+                float position_range = max_position - min_position;
+                
+                // 检查是否有紧急位置变化，可以立即打断强制静止状态
+                if (position_range > EMERGENCY_POSITION_THRESHOLD && forceStandstillState[i]) {
+                    forceStandstillState[i] = false;
+                    torqueDecayActive[i] = false;
+                    standstillDetectionCount[i] = 1;
+                    Serial.printf("电机%d 紧急位置变化检测(变化范围: %.4f)，立即打断强制静止状态\n", 
+                                 channel.motor_obj.id, position_range);
+                }
+                
+                if (position_range <= 0.15f && standstillDetectionCount[i] == 0 && !forceStandstillState[i]) {
+                    // 基于位置检测到静止，且标记为0时，触发强制静止状态
+                    forceStandstillState[i] = true;
+                    forceStandstillEndTime[i] = millis() + FORCE_STANDSTILL_DURATION;
+                    channel.detectedActivity = ACTIVITY_STANDSTILL;
+                    
+                    // 启动1秒力矩平滑衰减
+                    torqueDecayActive[i] = true;
+                    torqueDecayStartValue[i] = channel.target_torque; // 记录当前力矩值
+                    torqueDecayStartTime[i] = millis();
+                    
+                    Serial.printf("电机%d 基于位置检测到静止(变化范围: %.4f)，开始1秒力矩衰减(从%.2f到0)\n", 
+                                 channel.motor_obj.id, position_range, channel.target_torque);
+                }
+            }
+        } else {
+            // 使用陀螺仪数据进行静止检测
+            int16_t abs_x = abs(g_gyroData.x);
+            int16_t abs_y = abs(g_gyroData.y);
+            int16_t abs_z = abs(g_gyroData.z);
             
-            // 检查ACTIVITY_BUFFER_SIZE中的数据变化幅度
-            float min_position = channel.activityBuffer[0].position;
-            float max_position = channel.activityBuffer[0].position;
+            // 检查是否静止：三个轴的绝对值都小于100
+            bool isStandstill = (abs_x < 100) && (abs_y < 100) && (abs_z < 100);
             
-            // 找出缓冲区中的最大最小值
-            for (int j = 0; j < ACTIVITY_BUFFER_SIZE; j++) {
-                float pos = channel.activityBuffer[j].position;
-                if (pos < min_position) min_position = pos;
-                if (pos > max_position) max_position = pos;
+            // 检查是否有紧急运动：任一轴超过紧急阈值
+            bool hasEmergencyMotion = (abs_x > EMERGENCY_MOTION_THRESHOLD) || 
+                                    (abs_y > EMERGENCY_MOTION_THRESHOLD) || 
+                                    (abs_z > EMERGENCY_MOTION_THRESHOLD);
+            
+            // 优先检查紧急运动，可以立即打断强制静止状态
+            if (hasEmergencyMotion) {
+                for (int i = 0; i < 2; i++) {
+                    if (forceStandstillState[i]) {
+                        forceStandstillState[i] = false;
+                        torqueDecayActive[i] = false;
+                        standstillDetectionCount[i] = 1;
+                        Serial.printf("紧急运动检测 - X:%d, Y:%d, Z:%d，立即打断电机%d强制静止状态\n", 
+                                     g_gyroData.x, g_gyroData.y, g_gyroData.z, motorChannels[i].motor_obj.id);
+                    }
+                }
             }
             
-            float position_range = max_position - min_position;
-            
-            // 如果2秒内变化幅度在0.15以内，认为是静止状态
-            if (position_range <= 0.15f) {
-                // 设置力矩为0
-                channel.target_torque = 0.0f;
-                
-                // 暂停analyzeActivityAndSetTorque函数1秒
-                analysisTaskPaused[i] = true;
-                analysisPauseEndTime[i] = millis() + 1000; // 1秒后恢复
-                
-                Serial.printf("电机%d 检测到静止状态(变化范围: %.4f)，设置力矩为0，暂停分析1秒\n", 
-                             channel.motor_obj.id, position_range);
+            if (isStandstill) {
+                // 陀螺仪检测到静止状态
+                for (int i = 0; i < 2; i++) {
+                    MotorChannel& channel = motorChannels[i];
+                    
+                    // 当次数标记为0时，触发强制2秒静止状态
+                    if (standstillDetectionCount[i] == 0 && !forceStandstillState[i]) {
+                        forceStandstillState[i] = true;
+                        forceStandstillEndTime[i] = millis() + FORCE_STANDSTILL_DURATION;
+                        channel.detectedActivity = ACTIVITY_STANDSTILL;
+                        
+                        // 启动1秒力矩平滑衰减
+                        torqueDecayActive[i] = true;
+                        torqueDecayStartValue[i] = channel.target_torque; // 记录当前力矩值
+                        torqueDecayStartTime[i] = millis();
+                        
+                        Serial.printf("陀螺仪检测到静止 - X:%d, Y:%d, Z:%d，电机%d开始1秒力矩衰减(从%.2f到0)\n", 
+                                     g_gyroData.x, g_gyroData.y, g_gyroData.z, channel.motor_obj.id, channel.target_torque);
+                    }
+                }
             } else {
-                Serial.printf("电机%d 检测到运动，变化范围: %.4f > 0.15\n", 
-                             channel.motor_obj.id, position_range);
+                // 陀螺仪检测到运动 - 检查是否需要恢复状态机
+                bool hasMovement = (abs_x >= 100) || (abs_y >= 100) || (abs_z >= 100);
+                if (hasMovement) {
+                    for (int i = 0; i < 2; i++) {
+                        MotorChannel& channel = motorChannels[i];
+                        
+                        // 如果处于强制静止状态且时间已超过1秒，等待200ms后恢复状态机
+                        if (forceStandstillState[i] && millis() >= (forceStandstillEndTime[i] + RECOVERY_WAIT_DURATION)) {
+                            forceStandstillState[i] = false;
+                            torqueDecayActive[i] = false; // 确保衰减标志也被清除
+                            standstillDetectionCount[i] = 1;
+                            Serial.printf("陀螺仪检测到运动 - X:%d, Y:%d, Z:%d，电机%d状态机恢复，标记设为1\n", 
+                                         g_gyroData.x, g_gyroData.y, g_gyroData.z, channel.motor_obj.id);
+                        }
+                    }
+                }
             }
         }
         
@@ -776,15 +890,39 @@ void uartReceiveParseTask(void* parameter) {
 void analyzeActivityAndSetTorque(MotorChannel& channel) {
     int motor_index = channel.motor_obj.id - 1;
     
-    // 检查分析任务是否被暂停
-    if (analysisTaskPaused[motor_index]) {
-        if (millis() < analysisPauseEndTime[motor_index]) {
-            // 仍在暂停期内，直接返回
-            return;
+    // 检查是否处于强制静止状态
+    if (forceStandstillState[motor_index]) {
+        if (millis() < forceStandstillEndTime[motor_index]) {
+            // 仍在强制静止期内，处理力矩衰减
+            channel.detectedActivity = ACTIVITY_STANDSTILL;
+            
+            // 处理1秒力矩平滑衰减
+            if (torqueDecayActive[motor_index]) {
+                uint32_t elapsedTime = millis() - torqueDecayStartTime[motor_index];
+                const uint32_t DECAY_DURATION = 1000; // 1秒
+                
+                if (elapsedTime < DECAY_DURATION) {
+                    // 线性衰减：从初始值平滑降到0
+                    float decayProgress = (float)elapsedTime / DECAY_DURATION;
+                    channel.target_torque = torqueDecayStartValue[motor_index] * (1.0f - decayProgress);
+                } else {
+                    // 衰减完成，力矩设为0
+                    channel.target_torque = 0.0f;
+                    torqueDecayActive[motor_index] = false;
+                    Serial.printf("电机%d 力矩衰减完成，力矩已降至0\n", channel.motor_obj.id);
+                }
+            } else {
+                // 如果衰减未激活，直接设为0
+                channel.target_torque = 0.0f;
+            }
+            
+            return; // 状态机无效化，直接返回
         } else {
-            // 暂停结束，恢复分析
-            analysisTaskPaused[motor_index] = false;
-            Serial.printf("电机%d 分析任务恢复\n", channel.motor_obj.id);
+            // 时间已到2秒，但需要等待陀螺仪检测到运动才能恢复
+            // 这里不自动恢复，由standstillDetectionTask检测运动后恢复
+            channel.target_torque = 0.0f;
+            channel.detectedActivity = ACTIVITY_STANDSTILL;
+            return; // 继续保持静止状态，等待运动信号
         }
     }
     
@@ -818,14 +956,105 @@ void analyzeActivityAndSetTorque(MotorChannel& channel) {
 
     if (previousActivity != channel.detectedActivity) {
         if (previousActivity == ACTIVITY_STANDSTILL && channel.detectedActivity != ACTIVITY_STANDSTILL) {
+            // 检测到从静止到运动的状态变化，将标记设为0
+            standstillDetectionCount[motor_index] = 0;
             channel.activityChanged = true;
             channel.activityChangeTime = millis();
             channel.lastActivity = previousActivity;
+            Serial.printf("电机%d 检测到运动变化，标记设为0\n", channel.motor_obj.id);
+        }
+        
+        // 启动平滑过渡到新的目标力矩（内部会检查变化阈值）
+        startTorqueTransition(motor_index, raw_target_torque);
+    } else {
+        // 即使活动状态没变，也检查力矩是否需要调整（如参数变化）
+        float currentTargetTorque = channel.target_torque;
+        if (!torqueTransitionActive[motor_index] && abs(raw_target_torque - currentTargetTorque) >= TORQUE_CHANGE_THRESHOLD) {
+            startTorqueTransition(motor_index, raw_target_torque);
         }
     }
 
-    channel.target_torque = (assistParams.TORQUE_SMOOTHING_FACTOR * raw_target_torque) + ((1.0f - assistParams.TORQUE_SMOOTHING_FACTOR) * channel.target_torque);
+    // 应用平滑过渡的力矩值
+    channel.target_torque = getSmoothTorque(motor_index, channel.target_torque);
     if (abs(channel.target_torque) < 0.01) {
         channel.target_torque = 0.0f;
     }
+}
+
+// ==================== GY25T陀螺仪更新任务 ===================
+void gyroUpdateTask(void* parameter) {
+    TickType_t lastWakeTime = xTaskGetTickCount();
+    const TickType_t frequency = pdMS_TO_TICKS(50); // 20Hz更新频率(50ms)
+    
+    unsigned long lastPrintTime = 0;
+    const unsigned long printInterval = 1000; // 每秒打印一次数据
+    
+    for (;;) {
+        // 更新陀螺仪数据
+        gy25t_update();
+        
+        // 每秒打印一次陀螺仪数据用于调试
+        // unsigned long currentTime = millis();
+        // if (currentTime - lastPrintTime >= printInterval) {
+        //     if (g_gyroData.dataValid) {
+        //         Serial.printf("陀螺仪数据 - X:%d, Y:%d, Z:%d (时间:%lu)\n", 
+        //                       g_gyroData.x, g_gyroData.y, g_gyroData.z, g_gyroData.lastUpdateTime);
+        //     } else {
+        //         Serial.println("陀螺仪数据无效或未收到数据");
+        //     }
+        //     lastPrintTime = currentTime;
+        // }
+        
+        vTaskDelayUntil(&lastWakeTime, frequency);
+    }
+}
+
+// ==================== 平滑力矩变化功能实现 ===================
+void startTorqueTransition(int motorIndex, float targetTorque) {
+    float torqueDifference = abs(targetTorque - motorChannels[motorIndex].target_torque);
+    
+    // 如果力矩变化小于阈值，不启动平滑过渡，直接设置目标值
+    if (torqueDifference < TORQUE_CHANGE_THRESHOLD) {
+        motorChannels[motorIndex].target_torque = targetTorque;
+        return;
+    }
+    
+    torqueTransitionActive[motorIndex] = true;
+    torqueTransitionStartValue[motorIndex] = motorChannels[motorIndex].target_torque;
+    torqueTransitionTargetValue[motorIndex] = targetTorque;
+    torqueTransitionStartTime[motorIndex] = millis();
+    
+    Serial.printf("电机%d 开始力矩平滑过渡: %.2f -> %.2f (800ms)\n", 
+                 motorChannels[motorIndex].motor_obj.id, 
+                 torqueTransitionStartValue[motorIndex], 
+                 targetTorque);
+}
+
+float getSmoothTorque(int motorIndex, float currentTorque) {
+    if (!torqueTransitionActive[motorIndex]) {
+        return currentTorque;
+    }
+    
+    uint32_t elapsedTime = millis() - torqueTransitionStartTime[motorIndex];
+    
+    if (elapsedTime >= TORQUE_TRANSITION_DURATION) {
+        // 过渡完成
+        torqueTransitionActive[motorIndex] = false;
+        float finalTorque = torqueTransitionTargetValue[motorIndex];
+        Serial.printf("电机%d 力矩平滑过渡完成: %.2f\n", 
+                     motorChannels[motorIndex].motor_obj.id, finalTorque);
+        return finalTorque;
+    }
+    
+    // 计算过渡进度 (0.0 到 1.0)
+    float progress = (float)elapsedTime / TORQUE_TRANSITION_DURATION;
+    
+    // 使用三次缓动函数实现更平滑的过渡
+    float smoothProgress = progress * progress * (3.0f - 2.0f * progress);
+    
+    // 线性插值计算当前力矩值
+    float smoothTorque = torqueTransitionStartValue[motorIndex] + 
+                        (torqueTransitionTargetValue[motorIndex] - torqueTransitionStartValue[motorIndex]) * smoothProgress;
+    
+    return smoothTorque;
 }

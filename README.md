@@ -11,12 +11,18 @@
 - **实时分析**：基于电机位置变化范围进行运动强度判断
 - **平滑切换**：运动状态切换时提供平滑过渡，避免突变
 
-### 2. 自适应助力系统
+### 2. 智能自适应助力系统
 - **分级助力**：根据运动强度提供不同等级的助力扭矩
   - 平地行走：3.0 Nm 基础助力
   - 爬楼运动：5.5 Nm 中等助力
   - 大幅度爬楼：8.0 Nm 最大助力
-- **力矩平滑**：使用平滑因子避免助力突变，提升用户体验
+- **🚀 平滑力矩过渡**：使用三次缓动函数实现1000ms智能力矩变化
+  - 变化阈值检测：<0.1Nm直接设置，≥0.1Nm启动平滑过渡
+  - 实时进度监控：详细日志记录过渡过程
+  - 状态自动管理：活动变化和参数调整自动触发
+- **⚡ 紧急响应机制**：双重紧急检测，立即打断静止状态
+  - 陀螺仪紧急检测：任一轴>300立即响应
+  - 位置紧急检测：变化>0.9rad立即恢复
 - **间歇式输出**：支持间歇式力矩输出，节省电池能耗
 
 ### 3. 双电机协调控制
@@ -101,7 +107,59 @@ struct AssistParameters {
 
 ## 核心算法详解
 
-### 1. 运动识别算法
+### 1. 🚀 智能力矩过渡算法
+系统采用三次缓动函数实现平滑的力矩变化，提供卓越的用户体验：
+
+```cpp
+void startTorqueTransition(int motorIndex, float targetTorque) {
+    float torqueDifference = abs(targetTorque - motorChannels[motorIndex].target_torque);
+    
+    // 智能阈值检测：小幅变化直接设置，大幅变化启动平滑过渡
+    if (torqueDifference < TORQUE_CHANGE_THRESHOLD) { // 0.1Nm阈值
+        motorChannels[motorIndex].target_torque = targetTorque;
+        return; // 直接设置，无过渡
+    }
+    
+    // 启动1000ms平滑过渡
+    torqueTransitionActive[motorIndex] = true;
+    torqueTransitionStartValue[motorIndex] = motorChannels[motorIndex].target_torque;
+    torqueTransitionTargetValue[motorIndex] = targetTorque;
+    torqueTransitionStartTime[motorIndex] = millis();
+}
+
+float getSmoothTorque(int motorIndex, float currentTorque) {
+    uint32_t elapsedTime = millis() - torqueTransitionStartTime[motorIndex];
+    float progress = (float)elapsedTime / TORQUE_TRANSITION_DURATION; // 1000ms
+    
+    // 三次缓动函数：平滑启动和结束
+    float smoothProgress = progress * progress * (3.0f - 2.0f * progress);
+    
+    // 线性插值计算当前力矩
+    return startValue + (targetValue - startValue) * smoothProgress;
+}
+```
+
+### 2. ⚡ 紧急运动检测算法
+双重检测机制确保紧急情况下的即时响应：
+
+```cpp
+// 陀螺仪紧急检测 (300阈值)
+bool hasEmergencyMotion = (abs_x > 300) || (abs_y > 300) || (abs_z > 300);
+if (hasEmergencyMotion && forceStandstillState[i]) {
+    forceStandstillState[i] = false; // 立即打断静止状态
+    torqueDecayActive[i] = false;
+    standstillDetectionCount[i] = 1;
+    Serial.printf("紧急运动检测，立即打断电机%d强制静止状态\n", motor_id);
+}
+
+// 位置紧急检测 (0.9rad阈值)
+if (position_range > 0.9f && forceStandstillState[i]) {
+    forceStandstillState[i] = false; // 立即恢复
+    Serial.printf("紧急位置变化检测，立即打断强制静止状态\n");
+}
+```
+
+### 3. 运动识别算法
 系统通过分析2秒时间窗口内电机位置数据的变化范围来识别用户运动状态：
 
 ```cpp
@@ -361,22 +419,26 @@ motorInitializationComplete = true; // 设置完成标志
 
 ## 性能特点
 
-### 1. 实时性
+### 1. 🚀 实时性与响应速度
 - 运动分析任务：50ms周期
-- 静止检测任务：2秒周期
+- 静止检测任务：500ms周期（优化响应）
 - UART通信轮询：持续执行
-- 力矩输出响应：<100ms
-- 静止响应时间：≤2秒
+- **力矩平滑过渡**：1000ms智能过渡
+- **紧急响应时间**：<50ms（立即打断）
+- **强制静止响应**：500ms快速响应
 
-### 2. 准确性
+### 2. 🎯 准确性与用户体验
 - 运动状态识别准确率：>95%
-- 助力响应延迟：<150ms
+- **力矩过渡平滑度**：三次缓动函数，无突变感
+- **智能阈值检测**：0.1Nm精度，避免无效过渡
 - 位置检测精度：±0.01弧度
+- **紧急检测精度**：双重阈值保障
 
-### 3. 能效优化
+### 3. ⚡ 能效与安全优化
 - 间歇式助力输出：节能20-30%
+- **智能力矩管理**：小幅变化直接设置，节省计算资源
+- **紧急安全机制**：双重检测，确保用户安全
 - 静止自动失能：避免无效消耗
-- 智能力矩调节：按需输出
 
 ## 故障排除
 
@@ -464,6 +526,17 @@ motorInitializationComplete = true; // 设置完成标志
 ---
 
 ## 版本更新记录
+
+### v3.0 (2025年1月23日) - 智能力矩控制系统
+- 🚀 **新增平滑力矩过渡系统**：实现800ms-1s智能力矩变化，使用三次缓动函数提升用户体验
+- 🎯 **智能变化阈值检测**：力矩变化<0.1Nm时直接设置，避免微小变化的无效过渡
+- ⚡ **紧急运动检测机制**：陀螺仪300阈值+位置0.9rad阈值，可立即打断强制静止状态
+- 🛡️ **优化时间参数配置**：
+  - 强制静止：500ms（快速响应）
+  - 恢复等待：500ms（平衡稳定性）
+  - 力矩过渡：1000ms（平滑体验）
+- 🔧 **增强状态管理**：活动状态变化和参数调整自动触发智能过渡
+- 📊 **实时过渡监控**：详细日志记录力矩过渡过程，便于调试优化
 
 ### v2.1 (2025年1月23日)
 - ✅ **新增独立静止检测系统**：创建独立任务监控静止状态

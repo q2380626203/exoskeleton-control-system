@@ -5,6 +5,10 @@ HardwareSerial* motor_serial = nullptr;
 MI_Motor motors[2];
 MotorDataCallback data_callback = NULL;
 
+// 电机数据打印控制变量
+static unsigned long lastPrintTime[2] = {0, 0}; // 分别为电机1和电机2
+static const unsigned long PRINT_INTERVAL = 2000; // 2秒间隔
+
 // Helper function to convert float to uint for CAN transmission
 int float_to_uint(float x, float x_min, float x_max, int bits) {
     float span = x_max - x_min;
@@ -109,9 +113,15 @@ static void parse_can_frame(const uint8_t* can_payload) {
             // Parse mode status
             motor->mode = (status_part >> 6) & 0x03; // Bits 22-23
 
-            // --- Print Parsed Data for Debugging ---
-            Serial.printf("  [Parsed] ID: %d, Pos: %.2f, Vel: %.2f, Cur: %.2f, Temp: %.1f, Mode: %d, Err: 0x%X\n",
-                          motor->id, motor->position, motor->velocity, motor->current, motor->temperature, motor->mode, motor->error);
+            // --- Print Parsed Data for Debugging (每2秒一次) ---
+            unsigned long currentTime = millis();
+            int motorIndex = (motor->id == 1) ? 0 : 1; // 电机1对应索引0，电机2对应索引1
+            
+            if (currentTime - lastPrintTime[motorIndex] >= PRINT_INTERVAL) {
+                Serial.printf("  [Parsed] ID: %d, Pos: %.2f, Vel: %.2f, Cur: %.2f, Temp: %.1f, Mode: %d, Err: 0x%X\n",
+                              motor->id, motor->position, motor->velocity, motor->current, motor->temperature, motor->mode, motor->error);
+                lastPrintTime[motorIndex] = currentTime;
+            }
 
             if (data_callback) {
                 data_callback(motor);
@@ -159,6 +169,11 @@ void handle_uart_rx() {
 void UART_Rx_Init(MotorDataCallback callback) {
     motor_serial = &Serial1;
     motor_serial->begin(115200, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
+    
+    // 设置更大的串口缓冲区以提高通信可靠性
+    motor_serial->setRxBufferSize(1024);
+    motor_serial->setTxBufferSize(512);
+    
     data_callback = callback;
 }
 
