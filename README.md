@@ -13,9 +13,9 @@
 
 ### 2. 自适应助力系统
 - **分级助力**：根据运动强度提供不同等级的助力扭矩
-  - 平地行走：1.0 Nm 基础助力
-  - 爬楼运动：5.0 Nm 中等助力
-  - 大幅度爬楼：7.0 Nm 最大助力
+  - 平地行走：3.0 Nm 基础助力
+  - 爬楼运动：5.5 Nm 中等助力
+  - 大幅度爬楼：8.0 Nm 最大助力
 - **力矩平滑**：使用平滑因子避免助力突变，提升用户体验
 - **间歇式输出**：支持间歇式力矩输出，节省电池能耗
 
@@ -78,12 +78,12 @@ struct MotorChannel {
 #### 助力参数结构 (AssistParameters)
 ```cpp
 struct AssistParameters {
-    float MOVEMENT_THRESHOLD_WALK;         // 行走检测阈值: 0.25
-    float MOVEMENT_THRESHOLD_CLIMB;        // 爬楼检测阈值: 0.4
-    float MOVEMENT_THRESHOLD_CLIMB_STEEP;  // 大幅爬楼阈值: 0.7
-    float ASSIST_TORQUE_WALK;              // 行走助力扭矩: 1.0 Nm
-    float ASSIST_TORQUE_CLIMB;             // 爬楼助力扭矩: 5.0 Nm
-    float ASSIST_TORQUE_CLIMB_STEEP;       // 大幅爬楼扭矩: 7.0 Nm
+    float MOVEMENT_THRESHOLD_WALK;         // 行走检测阈值: 0.15
+    float MOVEMENT_THRESHOLD_CLIMB;        // 爬楼检测阈值: 0.3
+    float MOVEMENT_THRESHOLD_CLIMB_STEEP;  // 大幅爬楼阈值: 0.5
+    float ASSIST_TORQUE_WALK;              // 行走助力扭矩: 3.0 Nm
+    float ASSIST_TORQUE_CLIMB;             // 爬楼助力扭矩: 5.5 Nm
+    float ASSIST_TORQUE_CLIMB_STEEP;       // 大幅爬楼扭矩: 8.0 Nm
     float TORQUE_SMOOTHING_FACTOR;         // 力矩平滑因子: 0.2
     bool INTERMITTENT_ENABLED;             // 间歇模式启用
     float INTERMITTENT_DUTY;               // 间歇占空比: 0.5
@@ -121,11 +121,11 @@ void analyzeActivityAndSetTorque(MotorChannel& channel) {
 ```cpp
 // 根据运动类型设置基础扭矩
 if (detectedActivity == ACTIVITY_CLIMBING_STEEP) {
-    raw_target_torque = ASSIST_TORQUE_CLIMB_STEEP;  // 7.0 Nm
+    raw_target_torque = ASSIST_TORQUE_CLIMB_STEEP;  // 8.0 Nm
 } else if (detectedActivity == ACTIVITY_CLIMBING) {
-    raw_target_torque = ASSIST_TORQUE_CLIMB;        // 5.0 Nm
+    raw_target_torque = ASSIST_TORQUE_CLIMB;        // 5.5 Nm
 } else if (detectedActivity == ACTIVITY_WALKING) {
-    raw_target_torque = ASSIST_TORQUE_WALK;         // 1.0 Nm
+    raw_target_torque = ASSIST_TORQUE_WALK;         // 3.0 Nm
 } else {
     raw_target_torque = 0.0f;                       // 静止时无助力
 }
@@ -149,6 +149,38 @@ if (INTERMITTENT_ENABLED && applied_torque != 0) {
     }
 }
 ```
+
+## 系统启动流程
+
+### 启动时序保证
+系统采用分阶段启动机制，确保各组件按正确顺序初始化：
+
+```
+1. Serial通信启动 (115200波特率)
+   ↓
+2. 系统稳定等待 (3秒倒计时)
+   ↓  
+3. 电机对象初始化
+   ↓
+4. FreeRTOS任务创建
+   ├── UART接收解析任务 (优先级5)
+   ├── UART发送管理任务 (优先级4) - 阻塞等待
+   └── 运动分析任务 (优先级2)
+   ↓
+5. 电机模式初始化
+   ├── 设置电机1为电流模式 (CUR_MODE)
+   ├── 设置电机2为电流模式 (CUR_MODE)  
+   └── 设置初始化完成标志
+   ↓
+6. UART发送任务解除阻塞，开始正常工作
+   ↓
+7. BLE蓝牙服务启动
+```
+
+### 初始化安全机制
+- **硬件稳定等待**：上电后强制等待3秒，确保电机驱动器和通信模块稳定
+- **模式设置保证**：使用`motorInitializationComplete`标志确保电机模式设置完成后才开始发送电流指令
+- **任务同步机制**：UART发送任务在模式设置完成前保持阻塞状态
 
 ## 系统状态机
 
@@ -180,10 +212,23 @@ enum DetectedActivity {
 - **轮询机制**：主动轮询两台电机，获取实时反馈数据
 
 ### 主要控制指令
-- **电机使能**：`Motor_Enable(MI_Motor* motor)`
-- **电机复位**：`Motor_Reset(MI_Motor* motor, uint8_t clear_error)`
-- **设置扭矩**：`Set_CurMode(MI_Motor* motor, float current)`
-- **模式切换**：`Change_Mode(MI_Motor* motor, uint8_t mode)`
+- **模式切换**：`Change_Mode(MI_Motor* motor, uint8_t mode)` - 设置电机工作模式
+- **电机使能**：`Motor_Enable(MI_Motor* motor)` - 使能电机运行
+- **电机复位**：`Motor_Reset(MI_Motor* motor, uint8_t clear_error)` - 复位电机状态
+- **设置扭矩**：`Set_CurMode(MI_Motor* motor, float current)` - 电流模式下设置目标电流
+
+### 电机模式设置
+系统初始化时将所有电机设置为电流模式(`CUR_MODE = 3`)：
+```cpp
+// 在setup()函数中初始化电机模式
+for (int i = 0; i < 2; i++) {
+    Change_Mode(&motorChannels[i].motor_obj, CUR_MODE);
+    delay(100); // 每个电机设置后稍作延时
+}
+motorInitializationComplete = true; // 设置完成标志
+```
+
+**重要**：必须确保电机模式设置完成后才能发送电流指令，否则指令无效。
 
 ### 反馈数据解析
 系统实时解析电机反馈的以下数据：
@@ -255,14 +300,14 @@ enum DetectedActivity {
 ## 参数调优指南
 
 ### 运动检测阈值调整
-- `MOVEMENT_THRESHOLD_WALK` (0.25)：调整行走检测的敏感度
-- `MOVEMENT_THRESHOLD_CLIMB` (0.4)：调整爬楼检测的敏感度
-- `MOVEMENT_THRESHOLD_CLIMB_STEEP` (0.7)：调整大幅爬楼检测的敏感度
+- `MOVEMENT_THRESHOLD_WALK` (0.15)：调整行走检测的敏感度
+- `MOVEMENT_THRESHOLD_CLIMB` (0.3)：调整爬楼检测的敏感度
+- `MOVEMENT_THRESHOLD_CLIMB_STEEP` (0.5)：调整大幅爬楼检测的敏感度
 
 ### 助力扭矩调整
-- `ASSIST_TORQUE_WALK` (1.0 Nm)：平地行走助力大小
-- `ASSIST_TORQUE_CLIMB` (5.0 Nm)：爬楼助力大小
-- `ASSIST_TORQUE_CLIMB_STEEP` (7.0 Nm)：大幅爬楼助力大小
+- `ASSIST_TORQUE_WALK` (3.0 Nm)：平地行走助力大小
+- `ASSIST_TORQUE_CLIMB` (5.5 Nm)：爬楼助力大小
+- `ASSIST_TORQUE_CLIMB_STEEP` (8.0 Nm)：大幅爬楼助力大小
 
 ### 系统响应调整
 - `TORQUE_SMOOTHING_FACTOR` (0.2)：力矩平滑程度（0-1）
@@ -306,10 +351,29 @@ enum DetectedActivity {
 
 ### 调试信息
 系统提供详细的串口调试输出：
-- 电机数据解析信息
-- 运动状态识别结果
-- 助力扭矩计算过程
-- 错误状态监测信息
+- **启动阶段**：3秒倒计时、电机模式设置状态
+- **电机数据**：位置、速度、电流、温度反馈
+- **运动识别**：检测到的活动状态变化
+- **助力控制**：计算的目标扭矩和实际输出
+- **错误监测**：各类错误状态和处理信息
+
+### 启动调试输出示例
+```
+系统上电，等待3秒让所有子系统稳定...
+等待倒计时: 3秒
+等待倒计时: 2秒  
+等待倒计时: 1秒
+系统稳定，开始初始化...
+所有FreeRTOS任务已创建.
+正在设置电机工作模式为电流模式...
+等待电机模式初始化完成...
+电机 1 已设置为电流模式
+电机 2 已设置为电流模式
+所有电机已设置为电流模式.
+电机初始化完成，现在可以安全发送电流指令.
+电机初始化完成，uartTransmitManagerTask开始正常工作
+启动BLE服务器...
+```
 
 ## 扩展功能
 

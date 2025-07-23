@@ -24,7 +24,7 @@
 #include <BLEUtils.h>
 #include <BLE2902.h>
 
-#define ACTIVITY_BUFFER_SIZE 50
+#define ACTIVITY_BUFFER_SIZE 10
 
 // ==================== 助力模式参数结构体 (支持动态修改) ===================
 struct AssistParameters {
@@ -42,7 +42,7 @@ struct AssistParameters {
 };
 
 AssistParameters assistParams = {
-    0.25f, 0.4f, 0.7f, 1.0f, 5.0f, 7.0f, 0.2f, true, 0.5f, 0.2f, false
+    0.15f, 0.3f, 0.5f, 3.0f, 5.5f, 8.0f, 0.2f, true, 0.5f, 0.1f, false
 };
 
 // ==================== 核心数据结构与状态机 ===================
@@ -67,6 +67,8 @@ struct MotorChannel {
     volatile bool standstillConfirmed = false;
     volatile uint32_t intermittentCycleStartTime = 0;
     volatile bool isHighTorquePeriod = true;
+    volatile float standstillBaseAngle = 0.0f;    // 静止时的基准角度
+    volatile bool standstillBaseAngleSet = false; // 标记是否已设置基准角度
 };
 
 // ==================== 全局变量与任务句柄 ===================
@@ -80,6 +82,9 @@ TaskHandle_t analysisTaskHandle = NULL;
 // 标志变量，用于主循环中处理BLE通信
 volatile bool shouldSendParams = false;
 volatile bool shouldSendMotorData = false;
+
+// 初始化完成标志，确保模式设置完成后才开始发送电流指令
+volatile bool motorInitializationComplete = false;
 
 // ==================== 函数声明 ===================
 void uartReceiveParseTask(void* parameter);
@@ -363,6 +368,15 @@ void motorDataCallback(MI_Motor* updated_motor) {
 // ==================== Arduino Setup ===================
 void setup() {
     Serial.begin(115200);
+    
+    // 上电后等待3秒，让电机驱动器和其他系统稳定启动
+    Serial.println("系统上电，等待3秒让所有子系统稳定...");
+    for (int i = 3; i > 0; i--) {
+        Serial.printf("等待倒计时: %d秒\n", i);
+        delay(1000);
+    }
+    Serial.println("系统稳定，开始初始化...");
+    
     motorChannels[0].motor_obj.id = MOTER_1_ID;
     motorChannels[1].motor_obj.id = MOTER_2_ID;
     
@@ -385,6 +399,21 @@ void setup() {
     xTaskCreatePinnedToCore(uartTransmitManagerTask, "UartTransmitTask", 8192, NULL, 4, &uartTransmitManagerTaskHandle, 1);
     xTaskCreatePinnedToCore(analysisTask, "AnalysisTask", 8192, NULL, 2, &analysisTaskHandle, 0);
     Serial.println("所有FreeRTOS任务已创建.");
+    
+    // 初始化电机模式为电流模式
+    Serial.println("正在设置电机工作模式为电流模式...");
+    delay(500); // 给UART任务一些时间启动
+    
+    for (int i = 0; i < 2; i++) {
+        Change_Mode(&motorChannels[i].motor_obj, CUR_MODE);
+        delay(100); // 每个电机设置后稍作延时
+        Serial.printf("电机 %d 已设置为电流模式\n", motorChannels[i].motor_obj.id);
+    }
+    Serial.println("所有电机已设置为电流模式.");
+    
+    // 设置初始化完成标志，允许uartTransmitManagerTask开始发送电流指令
+    motorInitializationComplete = true;
+    Serial.println("电机初始化完成，现在可以安全发送电流指令.");
     
     // 增加堆栈大小，配置BLE
     Serial.println("启动BLE服务器...");
@@ -600,6 +629,13 @@ void uartTransmitManagerTask(void* parameter) {
     uint8_t next_motor_to_poll = MOTER_1_ID;
     const uint32_t INTERMITTENT_CYCLE_MS = 50;
     
+    // 等待电机初始化完成
+    while (!motorInitializationComplete) {
+        Serial.println("等待电机模式初始化完成...");
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    Serial.println("电机初始化完成，uartTransmitManagerTask开始正常工作");
+    
     for (;;) {
         MotorChannel& channel = motorChannels[next_motor_to_poll - 1];
         MI_Motor* motor_to_poll = &channel.motor_obj;
@@ -691,29 +727,50 @@ void uartReceiveParseTask(void* parameter) {
 }
 
 void analyzeActivityAndSetTorque(MotorChannel& channel) {
-    float max_pos = -1000.0f, min_pos = 1000.0f;
-    int current_idx = channel.activityBufferIndex;
-    for (int i = 0; i < ACTIVITY_BUFFER_SIZE; i++) {
-        current_idx = (current_idx == 0) ? (ACTIVITY_BUFFER_SIZE - 1) : (current_idx - 1);
-        if (channel.activityBuffer[current_idx].position > max_pos) max_pos = channel.activityBuffer[current_idx].position;
-        if (channel.activityBuffer[current_idx].position < min_pos) min_pos = channel.activityBuffer[current_idx].position;
-    }
-    float pos_range = max_pos - min_pos;
     float raw_target_torque = 0.0f;
     DetectedActivity previousActivity = channel.detectedActivity;
-
-    if (pos_range > assistParams.MOVEMENT_THRESHOLD_CLIMB_STEEP) {
-        channel.detectedActivity = ACTIVITY_CLIMBING_STEEP;
-        raw_target_torque = (channel.motor_obj.id == MOTER_1_ID) ? -assistParams.ASSIST_TORQUE_CLIMB_STEEP : assistParams.ASSIST_TORQUE_CLIMB_STEEP;
-    } else if (pos_range > assistParams.MOVEMENT_THRESHOLD_CLIMB) {
-        channel.detectedActivity = ACTIVITY_CLIMBING;
-        raw_target_torque = (channel.motor_obj.id == MOTER_1_ID) ? -assistParams.ASSIST_TORQUE_CLIMB : assistParams.ASSIST_TORQUE_CLIMB;
-    } else if (pos_range > assistParams.MOVEMENT_THRESHOLD_WALK) {
-        channel.detectedActivity = ACTIVITY_WALKING;
-        raw_target_torque = (channel.motor_obj.id == MOTER_1_ID) ? -assistParams.ASSIST_TORQUE_WALK : assistParams.ASSIST_TORQUE_WALK;
-    } else {
-        raw_target_torque = 0.0f;
+    
+    // 如果还没有设置基准角度，先设置基准
+    if (!channel.standstillBaseAngleSet) {
+        float angle_sum = 0.0f;
+        int sum_idx = channel.activityBufferIndex;
+        for (int i = 0; i < ACTIVITY_BUFFER_SIZE; i++) {
+            sum_idx = (sum_idx == 0) ? (ACTIVITY_BUFFER_SIZE - 1) : (sum_idx - 1);
+            angle_sum += channel.activityBuffer[sum_idx].position;
+        }
+        channel.standstillBaseAngle = angle_sum / ACTIVITY_BUFFER_SIZE;
+        channel.standstillBaseAngleSet = true;
+        
+        Serial.printf("电机%d 静止基准角度已设置: %.4f 弧度\n", 
+                     channel.motor_obj.id, channel.standstillBaseAngle);
+        
+        // 首次设置基准时，默认为静止状态
         channel.detectedActivity = ACTIVITY_STANDSTILL;
+        raw_target_torque = 0.0f;
+    } else {
+        // 基于静止基准计算最大偏移量
+        float max_deviation = 0.0f;
+        int current_idx = channel.activityBufferIndex;
+        for (int i = 0; i < ACTIVITY_BUFFER_SIZE; i++) {
+            current_idx = (current_idx == 0) ? (ACTIVITY_BUFFER_SIZE - 1) : (current_idx - 1);
+            float deviation = abs(channel.activityBuffer[current_idx].position - channel.standstillBaseAngle);
+            if (deviation > max_deviation) max_deviation = deviation;
+        }
+
+        // 基于偏移量判断运动状态
+        if (max_deviation > assistParams.MOVEMENT_THRESHOLD_CLIMB_STEEP) {
+            channel.detectedActivity = ACTIVITY_CLIMBING_STEEP;
+            raw_target_torque = (channel.motor_obj.id == MOTER_1_ID) ? -assistParams.ASSIST_TORQUE_CLIMB_STEEP : assistParams.ASSIST_TORQUE_CLIMB_STEEP;
+        } else if (max_deviation > assistParams.MOVEMENT_THRESHOLD_CLIMB) {
+            channel.detectedActivity = ACTIVITY_CLIMBING;
+            raw_target_torque = (channel.motor_obj.id == MOTER_1_ID) ? -assistParams.ASSIST_TORQUE_CLIMB : assistParams.ASSIST_TORQUE_CLIMB;
+        } else if (max_deviation > assistParams.MOVEMENT_THRESHOLD_WALK) {
+            channel.detectedActivity = ACTIVITY_WALKING;
+            raw_target_torque = (channel.motor_obj.id == MOTER_1_ID) ? -assistParams.ASSIST_TORQUE_WALK : assistParams.ASSIST_TORQUE_WALK;
+        } else {
+            channel.detectedActivity = ACTIVITY_STANDSTILL;
+            raw_target_torque = 0.0f;
+        }
     }
 
     if (previousActivity != channel.detectedActivity) {
