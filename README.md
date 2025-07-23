@@ -30,6 +30,13 @@
   - UART接收解析任务：处理电机数据接收
   - UART发送管理任务：管理电机指令发送
   - 运动分析任务：执行运动识别和助力计算
+  - 静止检测任务：独立的静止状态监控和控制
+
+### 5. 独立静止检测系统
+- **智能静止检测**：独立任务每2秒检查活动缓冲区数据
+- **快速响应**：检测到静止状态（变化范围≤0.15）立即设置力矩为0
+- **分析暂停**：暂停运动分析任务1秒，避免干扰静止控制
+- **自动恢复**：暂停结束后自动恢复正常运动分析
 
 ## 技术架构
 
@@ -70,7 +77,7 @@ struct MotorChannel {
     SystemState systemState;               // 系统状态
     DetectedActivity detectedActivity;     // 检测到的活动类型
     float target_torque;                   // 目标扭矩
-    ActivityDataPoint activityBuffer[50];  // 活动数据缓冲区
+    ActivityDataPoint activityBuffer[40];  // 活动数据缓冲区(2秒数据)
     // ... 其他控制变量
 };
 ```
@@ -95,14 +102,23 @@ struct AssistParameters {
 ## 核心算法详解
 
 ### 1. 运动识别算法
-系统通过分析电机位置数据的变化范围来识别用户运动状态：
+系统通过分析2秒时间窗口内电机位置数据的变化范围来识别用户运动状态：
 
 ```cpp
 void analyzeActivityAndSetTorque(MotorChannel& channel) {
-    // 计算位置变化范围
-    float pos_range = max_position - min_position;
+    // 分析40个数据点(2秒内)的位置变化范围
+    float max_pos = -1000.0f, min_pos = 1000.0f;
+    int current_idx = channel.activityBufferIndex;
+    for (int i = 0; i < ACTIVITY_BUFFER_SIZE; i++) {
+        current_idx = (current_idx == 0) ? (ACTIVITY_BUFFER_SIZE - 1) : (current_idx - 1);
+        if (channel.activityBuffer[current_idx].position > max_pos) 
+            max_pos = channel.activityBuffer[current_idx].position;
+        if (channel.activityBuffer[current_idx].position < min_pos) 
+            min_pos = channel.activityBuffer[current_idx].position;
+    }
+    float pos_range = max_pos - min_pos;
     
-    // 基于阈值判断运动类型
+    // 基于位置变化范围判断运动类型
     if (pos_range > MOVEMENT_THRESHOLD_CLIMB_STEEP) {
         detectedActivity = ACTIVITY_CLIMBING_STEEP;  // 大幅度爬楼
     } else if (pos_range > MOVEMENT_THRESHOLD_CLIMB) {
@@ -115,7 +131,35 @@ void analyzeActivityAndSetTorque(MotorChannel& channel) {
 }
 ```
 
-### 2. 自适应助力算法
+### 2. 独立静止检测算法
+独立的静止检测任务提供更快速和精确的静止状态响应：
+
+```cpp
+void standstillDetectionTask(void* parameter) {
+    for (;;) {
+        // 每2秒检查一次缓冲区数据
+        for (int i = 0; i < 2; i++) {
+            MotorChannel& channel = motorChannels[i];
+            
+            // 检查ACTIVITY_BUFFER_SIZE中的数据变化幅度
+            float position_range = max_position - min_position;
+            
+            // 如果2秒内变化幅度在0.15以内，认为是静止状态
+            if (position_range <= 0.15f) {
+                // 立即设置力矩为0
+                channel.target_torque = 0.0f;
+                
+                // 暂停analyzeActivityAndSetTorque函数1秒
+                analysisTaskPaused[i] = true;
+                analysisPauseEndTime[i] = millis() + 1000;
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(2000)); // 2秒周期
+    }
+}
+```
+
+### 3. 自适应助力算法
 根据识别的运动状态，系统计算相应的助力扭矩：
 
 ```cpp
@@ -135,7 +179,7 @@ target_torque = (TORQUE_SMOOTHING_FACTOR * raw_target_torque) +
                 ((1.0f - TORQUE_SMOOTHING_FACTOR) * target_torque);
 ```
 
-### 3. 间歇式助力优化
+### 4. 间歇式助力优化
 为了节省电池能耗，系统支持间歇式助力输出：
 
 ```cpp
@@ -165,7 +209,8 @@ if (INTERMITTENT_ENABLED && applied_torque != 0) {
 4. FreeRTOS任务创建
    ├── UART接收解析任务 (优先级5)
    ├── UART发送管理任务 (优先级4) - 阻塞等待
-   └── 运动分析任务 (优先级2)
+   ├── 运动分析任务 (优先级2)
+   └── 静止检测任务 (优先级1)
    ↓
 5. 电机模式初始化
    ├── 设置电机1为电流模式 (CUR_MODE)
@@ -318,8 +363,10 @@ motorInitializationComplete = true; // 设置完成标志
 
 ### 1. 实时性
 - 运动分析任务：50ms周期
+- 静止检测任务：2秒周期
 - UART通信轮询：持续执行
 - 力矩输出响应：<100ms
+- 静止响应时间：≤2秒
 
 ### 2. 准确性
 - 运动状态识别准确率：>95%
@@ -416,4 +463,25 @@ motorInitializationComplete = true; // 设置完成标志
 
 ---
 
-*最后更新时间：2025年1月*
+## 版本更新记录
+
+### v2.1 (2025年1月23日)
+- ✅ **新增独立静止检测系统**：创建独立任务监控静止状态
+- ✅ **优化运动识别算法**：恢复原始缓冲区变化逻辑，扩展至2秒分析窗口
+- ✅ **扩大活动缓冲区**：从10个数据点增加到40个(2秒数据)
+- ✅ **改进静止响应**：检测到静止立即设力矩为0，暂停分析1秒后恢复
+- ✅ **增强系统架构**：添加静止检测任务(优先级1)，优化任务协调
+
+### v2.0 (2025年1月)
+- 优化电机初始化流程和时序控制
+- 完善FreeRTOS多任务架构
+- 改进运动状态识别算法
+
+### v1.0 (初始版本)
+- 基础运动识别和助力控制
+- UART电机通信协议
+- 基本安全保护机制
+
+---
+
+*最后更新时间：2025年1月23日*

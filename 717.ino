@@ -24,7 +24,7 @@
 #include <BLEUtils.h>
 #include <BLE2902.h>
 
-#define ACTIVITY_BUFFER_SIZE 10
+#define ACTIVITY_BUFFER_SIZE 40
 
 // ==================== 助力模式参数结构体 (支持动态修改) ===================
 struct AssistParameters {
@@ -67,8 +67,6 @@ struct MotorChannel {
     volatile bool standstillConfirmed = false;
     volatile uint32_t intermittentCycleStartTime = 0;
     volatile bool isHighTorquePeriod = true;
-    volatile float standstillBaseAngle = 0.0f;    // 静止时的基准角度
-    volatile bool standstillBaseAngleSet = false; // 标记是否已设置基准角度
 };
 
 // ==================== 全局变量与任务句柄 ===================
@@ -78,6 +76,7 @@ SemaphoreHandle_t motor2DataReceivedSemaphore;
 TaskHandle_t uartReceiveParseTaskHandle = NULL;
 TaskHandle_t uartTransmitManagerTaskHandle = NULL;
 TaskHandle_t analysisTaskHandle = NULL;
+TaskHandle_t standstillDetectionTaskHandle = NULL;
 
 // 标志变量，用于主循环中处理BLE通信
 volatile bool shouldSendParams = false;
@@ -86,10 +85,15 @@ volatile bool shouldSendMotorData = false;
 // 初始化完成标志，确保模式设置完成后才开始发送电流指令
 volatile bool motorInitializationComplete = false;
 
+// 静止检测控制变量
+volatile bool analysisTaskPaused[2] = {false, false}; // 控制每个电机的分析任务是否暂停
+volatile uint32_t analysisPauseEndTime[2] = {0, 0};   // 暂停结束时间
+
 // ==================== 函数声明 ===================
 void uartReceiveParseTask(void* parameter);
 void uartTransmitManagerTask(void* parameter);
 void analysisTask(void* parameter);
+void standstillDetectionTask(void* parameter);
 void analyzeActivityAndSetTorque(MotorChannel& channel);
 void motorDataCallback(MI_Motor* updated_motor);
 void sendMotorData();
@@ -398,6 +402,7 @@ void setup() {
     xTaskCreatePinnedToCore(uartReceiveParseTask, "UartReceiveTask", 8192, NULL, 5, &uartReceiveParseTaskHandle, 1);
     xTaskCreatePinnedToCore(uartTransmitManagerTask, "UartTransmitTask", 8192, NULL, 4, &uartTransmitManagerTaskHandle, 1);
     xTaskCreatePinnedToCore(analysisTask, "AnalysisTask", 8192, NULL, 2, &analysisTaskHandle, 0);
+    xTaskCreatePinnedToCore(standstillDetectionTask, "StandstillDetectionTask", 4096, NULL, 1, &standstillDetectionTaskHandle, 0);
     Serial.println("所有FreeRTOS任务已创建.");
     
     // 初始化电机模式为电流模式
@@ -719,6 +724,48 @@ void uartTransmitManagerTask(void* parameter) {
     }
 }
 
+void standstillDetectionTask(void* parameter) {
+    TickType_t lastWakeTime = xTaskGetTickCount();
+    const TickType_t frequency = pdMS_TO_TICKS(2000); // 每2秒检查一次
+    
+    for (;;) {
+        for (int i = 0; i < 2; i++) {
+            MotorChannel& channel = motorChannels[i];
+            
+            // 检查ACTIVITY_BUFFER_SIZE中的数据变化幅度
+            float min_position = channel.activityBuffer[0].position;
+            float max_position = channel.activityBuffer[0].position;
+            
+            // 找出缓冲区中的最大最小值
+            for (int j = 0; j < ACTIVITY_BUFFER_SIZE; j++) {
+                float pos = channel.activityBuffer[j].position;
+                if (pos < min_position) min_position = pos;
+                if (pos > max_position) max_position = pos;
+            }
+            
+            float position_range = max_position - min_position;
+            
+            // 如果2秒内变化幅度在0.15以内，认为是静止状态
+            if (position_range <= 0.15f) {
+                // 设置力矩为0
+                channel.target_torque = 0.0f;
+                
+                // 暂停analyzeActivityAndSetTorque函数1秒
+                analysisTaskPaused[i] = true;
+                analysisPauseEndTime[i] = millis() + 1000; // 1秒后恢复
+                
+                Serial.printf("电机%d 检测到静止状态(变化范围: %.4f)，设置力矩为0，暂停分析1秒\n", 
+                             channel.motor_obj.id, position_range);
+            } else {
+                Serial.printf("电机%d 检测到运动，变化范围: %.4f > 0.15\n", 
+                             channel.motor_obj.id, position_range);
+            }
+        }
+        
+        vTaskDelayUntil(&lastWakeTime, frequency);
+    }
+}
+
 void uartReceiveParseTask(void* parameter) {
     for (;;) {
         handle_uart_rx();
@@ -727,50 +774,46 @@ void uartReceiveParseTask(void* parameter) {
 }
 
 void analyzeActivityAndSetTorque(MotorChannel& channel) {
+    int motor_index = channel.motor_obj.id - 1;
+    
+    // 检查分析任务是否被暂停
+    if (analysisTaskPaused[motor_index]) {
+        if (millis() < analysisPauseEndTime[motor_index]) {
+            // 仍在暂停期内，直接返回
+            return;
+        } else {
+            // 暂停结束，恢复分析
+            analysisTaskPaused[motor_index] = false;
+            Serial.printf("电机%d 分析任务恢复\n", channel.motor_obj.id);
+        }
+    }
+    
     float raw_target_torque = 0.0f;
     DetectedActivity previousActivity = channel.detectedActivity;
     
-    // 如果还没有设置基准角度，先设置基准
-    if (!channel.standstillBaseAngleSet) {
-        float angle_sum = 0.0f;
-        int sum_idx = channel.activityBufferIndex;
-        for (int i = 0; i < ACTIVITY_BUFFER_SIZE; i++) {
-            sum_idx = (sum_idx == 0) ? (ACTIVITY_BUFFER_SIZE - 1) : (sum_idx - 1);
-            angle_sum += channel.activityBuffer[sum_idx].position;
-        }
-        channel.standstillBaseAngle = angle_sum / ACTIVITY_BUFFER_SIZE;
-        channel.standstillBaseAngleSet = true;
-        
-        Serial.printf("电机%d 静止基准角度已设置: %.4f 弧度\n", 
-                     channel.motor_obj.id, channel.standstillBaseAngle);
-        
-        // 首次设置基准时，默认为静止状态
+    // 使用最初的缓冲区变化逻辑：分析2秒内的位置变化范围
+    float max_pos = -1000.0f, min_pos = 1000.0f;
+    int current_idx = channel.activityBufferIndex;
+    for (int i = 0; i < ACTIVITY_BUFFER_SIZE; i++) {
+        current_idx = (current_idx == 0) ? (ACTIVITY_BUFFER_SIZE - 1) : (current_idx - 1);
+        if (channel.activityBuffer[current_idx].position > max_pos) max_pos = channel.activityBuffer[current_idx].position;
+        if (channel.activityBuffer[current_idx].position < min_pos) min_pos = channel.activityBuffer[current_idx].position;
+    }
+    float pos_range = max_pos - min_pos;
+
+    // 基于位置变化范围判断运动状态
+    if (pos_range > assistParams.MOVEMENT_THRESHOLD_CLIMB_STEEP) {
+        channel.detectedActivity = ACTIVITY_CLIMBING_STEEP;
+        raw_target_torque = (channel.motor_obj.id == MOTER_1_ID) ? -assistParams.ASSIST_TORQUE_CLIMB_STEEP : assistParams.ASSIST_TORQUE_CLIMB_STEEP;
+    } else if (pos_range > assistParams.MOVEMENT_THRESHOLD_CLIMB) {
+        channel.detectedActivity = ACTIVITY_CLIMBING;
+        raw_target_torque = (channel.motor_obj.id == MOTER_1_ID) ? -assistParams.ASSIST_TORQUE_CLIMB : assistParams.ASSIST_TORQUE_CLIMB;
+    } else if (pos_range > assistParams.MOVEMENT_THRESHOLD_WALK) {
+        channel.detectedActivity = ACTIVITY_WALKING;
+        raw_target_torque = (channel.motor_obj.id == MOTER_1_ID) ? -assistParams.ASSIST_TORQUE_WALK : assistParams.ASSIST_TORQUE_WALK;
+    } else {
         channel.detectedActivity = ACTIVITY_STANDSTILL;
         raw_target_torque = 0.0f;
-    } else {
-        // 基于静止基准计算最大偏移量
-        float max_deviation = 0.0f;
-        int current_idx = channel.activityBufferIndex;
-        for (int i = 0; i < ACTIVITY_BUFFER_SIZE; i++) {
-            current_idx = (current_idx == 0) ? (ACTIVITY_BUFFER_SIZE - 1) : (current_idx - 1);
-            float deviation = abs(channel.activityBuffer[current_idx].position - channel.standstillBaseAngle);
-            if (deviation > max_deviation) max_deviation = deviation;
-        }
-
-        // 基于偏移量判断运动状态
-        if (max_deviation > assistParams.MOVEMENT_THRESHOLD_CLIMB_STEEP) {
-            channel.detectedActivity = ACTIVITY_CLIMBING_STEEP;
-            raw_target_torque = (channel.motor_obj.id == MOTER_1_ID) ? -assistParams.ASSIST_TORQUE_CLIMB_STEEP : assistParams.ASSIST_TORQUE_CLIMB_STEEP;
-        } else if (max_deviation > assistParams.MOVEMENT_THRESHOLD_CLIMB) {
-            channel.detectedActivity = ACTIVITY_CLIMBING;
-            raw_target_torque = (channel.motor_obj.id == MOTER_1_ID) ? -assistParams.ASSIST_TORQUE_CLIMB : assistParams.ASSIST_TORQUE_CLIMB;
-        } else if (max_deviation > assistParams.MOVEMENT_THRESHOLD_WALK) {
-            channel.detectedActivity = ACTIVITY_WALKING;
-            raw_target_torque = (channel.motor_obj.id == MOTER_1_ID) ? -assistParams.ASSIST_TORQUE_WALK : assistParams.ASSIST_TORQUE_WALK;
-        } else {
-            channel.detectedActivity = ACTIVITY_STANDSTILL;
-            raw_target_torque = 0.0f;
-        }
     }
 
     if (previousActivity != channel.detectedActivity) {
