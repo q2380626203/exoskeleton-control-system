@@ -22,7 +22,7 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 
-#define ACTIVITY_BUFFER_SIZE 30
+#define ACTIVITY_BUFFER_SIZE 50
 
 // ==================== 助力模式参数结构体 (支持动态修改) ===================
 // AssistParameters结构体已在ble_manager.h中定义
@@ -67,8 +67,18 @@ TaskHandle_t gyroUpdateTaskHandle = NULL;
 // 初始化完成标志，确保模式设置完成后才开始发送电流指令
 volatile bool motorInitializationComplete = false;
 
+// 多阶段检测状态枚举
+enum DetectionPhase {
+    PHASE_NORMAL = 0,        // 正常运行：电机位置主检测
+    PHASE_FORCE_STANDSTILL,  // 强制静止：2秒静止期 + 力矩衰减
+    PHASE_RECOVERY_TRANSITION, // 恢复过渡：纯陀螺仪检测期
+    PHASE_FULL_RECOVERY      // 完全恢复：正常双重检测
+};
+
 // 静止检测控制变量
 volatile uint8_t standstillDetectionCount[2] = {1, 1}; // 静止检测次数标记，默认为1
+volatile DetectionPhase detectionPhase[2] = {PHASE_NORMAL, PHASE_NORMAL}; // 检测阶段
+volatile uint32_t phaseStartTime[2] = {0, 0};          // 阶段开始时间
 volatile bool forceStandstillState[2] = {false, false}; // 强制静止状态标志
 volatile uint32_t forceStandstillEndTime[2] = {0, 0};   // 强制静止状态结束时间
 volatile bool torqueDecayActive[2] = {false, false};    // 力矩衰减激活标志（强制静止检测使用）
@@ -142,6 +152,10 @@ void setup() {
         motorChannels[i].standstillConfirmed = false;
         motorChannels[i].intermittentCycleStartTime = 0;
         motorChannels[i].isHighTorquePeriod = true;
+        
+        // 初始化多阶段检测系统
+        detectionPhase[i] = PHASE_NORMAL;
+        phaseStartTime[i] = 0;
     }
 
     motor1DataReceivedSemaphore = xSemaphoreCreateBinary();
@@ -356,83 +370,113 @@ void standstillDetectionTask(void* parameter) {
     const TickType_t frequency = pdMS_TO_TICKS(100); // 每0.1秒检查一次，提高响应速度
     
     for (;;) {
+        uint32_t currentTime = millis();
+        
         // 先检查电机位置静止状态
         bool motorPositionStandstill[2] = {false, false};
-        
         for (int i = 0; i < 2; i++) {
             MotorChannel& channel = motorChannels[i];
-            // 使用位置变化范围进行检测，
-            float pos_range_500ms = getMotorPositionRange(channel, 15);
+            float pos_range_500ms = getMotorPositionRange(channel, 10);
             motorPositionStandstill[i] = (pos_range_500ms < 0.20f);
         }
         
         // 再检查陀螺仪静止状态（使用滑动窗口）
         bool gyroStandstill = gy25t_isStandstill();
+        bool gyroHasMovement = false;
+        if (g_gyroData.dataValid) {
+            int16_t abs_x = abs(g_gyroData.x);
+            int16_t abs_y = abs(g_gyroData.y);
+            int16_t abs_z = abs(g_gyroData.z);
+            gyroHasMovement = (abs_x >= 100) || (abs_y >= 100) || (abs_z >= 100);
+        }
         
-        // 检查陀螺仪数据有效性决定使用的检测策略
-        if (!g_gyroData.dataValid) {
-            // 如果陀螺仪数据无效，只使用电机位置检测
-            for (int i = 0; i < 2; i++) {
-                MotorChannel& channel = motorChannels[i];
-                
-                if (motorPositionStandstill[i] && standstillDetectionCount[i] == 0 && !forceStandstillState[i]) {
-                    // 仅基于位置检测到静止，且标记为0时，触发强制静止状态
-                    forceStandstillState[i] = true;
-                    forceStandstillEndTime[i] = millis() + 500;
-                    channel.detectedActivity = ACTIVITY_STANDSTILL;
-                    
-                    // 启动力矩衰减
-                    torqueDecayActive[i] = true;
-                    torqueDecayStartValue[i] = channel.target_torque; // 记录当前力矩值
-                    torqueDecayStartTime[i] = millis();
-                    
-                    Serial.printf("电机%d 基于0.5s位置检测到静止(变化范围: %.4f < 0.15)，开始阶梯式力矩衰减(从%.2f到0，每0.3秒降低2Nm)\n", 
-                                 channel.motor_obj.id, getMotorPositionRange(channel, 10), channel.target_torque);
-                }
-            }
-        } else {
-            // 陀螺仪数据有效，使用双重检测：需要电机位置和陀螺仪同时检测到静止
-            if (gyroStandstill) {
-                // 陀螺仪检测到静止状态，再检查电机位置
-                for (int i = 0; i < 2; i++) {
-                    MotorChannel& channel = motorChannels[i];
-                    
-                    // 需要同时满足：陀螺仪静止 + 电机位置静止 + 标记为0 + 未处于强制静止状态
-                    if (motorPositionStandstill[i] && standstillDetectionCount[i] == 0 && !forceStandstillState[i]) {
-                        forceStandstillState[i] = true;
-                        forceStandstillEndTime[i] = millis() + 500;
-                        channel.detectedActivity = ACTIVITY_STANDSTILL;
+        // 为每个电机处理多阶段检测逻辑
+        for (int i = 0; i < 2; i++) {
+            MotorChannel& channel = motorChannels[i];
+            
+            switch (detectionPhase[i]) {
+                case PHASE_NORMAL:
+                    // 阶段1：正常运行 - 电机位置主检测
+                    if (standstillDetectionCount[i] == 0) {
+                        bool shouldTriggerStandstill = false;
                         
-                        // 启动力矩衰减
-                        torqueDecayActive[i] = true;
-                        torqueDecayStartValue[i] = channel.target_torque; // 记录当前力矩值
-                        torqueDecayStartTime[i] = millis();
+                        if (!g_gyroData.dataValid) {
+                            // 陀螺仪无效，仅使用位置检测
+                            shouldTriggerStandstill = motorPositionStandstill[i];
+                        } else {
+                            // 陀螺仪有效，使用双重检测
+                            shouldTriggerStandstill = motorPositionStandstill[i] && gyroStandstill;
+                        }
                         
-                        Serial.printf("双重检测到静止 - 陀螺仪(X:%d, Y:%d, Z:%d) + 0.5s位置检测(变化范围: %.4f < 0.15)，电机%d开始阶梯式力矩衰减(从%.2f到0，每0.3秒降低2Nm)\n", 
-                                     g_gyroData.x, g_gyroData.y, g_gyroData.z, getMotorPositionRange(channel, 10), channel.motor_obj.id, channel.target_torque);
-                    }
-                }
-            } else {
-                // 陀螺仪检测到运动 - 检查是否需要恢复状态机
-                int16_t abs_x = abs(g_gyroData.x);
-                int16_t abs_y = abs(g_gyroData.y);
-                int16_t abs_z = abs(g_gyroData.z);
-                bool hasMovement = (abs_x >= 100) || (abs_y >= 100) || (abs_z >= 100);
-                
-                if (hasMovement) {
-                    for (int i = 0; i < 2; i++) {
-                        MotorChannel& channel = motorChannels[i];
-                        
-                        // 如果处于强制静止状态且时间已超过，等待后恢复状态机
-                        if (forceStandstillState[i] && millis() >= (forceStandstillEndTime[i] + 2000)) {
-                            forceStandstillState[i] = false;
-                            torqueDecayActive[i] = false; // 确保衰减标志也被清除
-                            standstillDetectionCount[i] = 1;
-                            Serial.printf("陀螺仪检测到运动 - X:%d, Y:%d, Z:%d，电机%d状态机恢复，标记设为1\n", 
-                                         g_gyroData.x, g_gyroData.y, g_gyroData.z, channel.motor_obj.id);
+                        if (shouldTriggerStandstill) {
+                            // 触发强制静止状态
+                            detectionPhase[i] = PHASE_FORCE_STANDSTILL;
+                            phaseStartTime[i] = currentTime;
+                            forceStandstillState[i] = true;
+                            forceStandstillEndTime[i] = currentTime + 2000; // 2秒强制静止
+                            channel.detectedActivity = ACTIVITY_STANDSTILL;
+                            
+                            // 启动力矩衰减
+                            torqueDecayActive[i] = true;
+                            torqueDecayStartValue[i] = channel.target_torque;
+                            torqueDecayStartTime[i] = currentTime;
+                            
+                            Serial.printf("电机%d 进入PHASE_FORCE_STANDSTILL，开始2秒强制静止+力矩衰减\n", channel.motor_obj.id);
                         }
                     }
-                }
+                    break;
+                    
+                case PHASE_FORCE_STANDSTILL:
+                    // 阶段2：强制静止期 - 2秒内进行力矩衰减，期间清空位置缓冲区
+                    if (currentTime >= forceStandstillEndTime[i]) {
+                        // 2秒强制静止期结束，进入恢复过渡期
+                        detectionPhase[i] = PHASE_RECOVERY_TRANSITION;
+                        phaseStartTime[i] = currentTime;
+                        forceStandstillState[i] = false;
+                        torqueDecayActive[i] = false;
+                        
+                        Serial.printf("电机%d 进入PHASE_RECOVERY_TRANSITION，开始纯陀螺仪检测期\n", channel.motor_obj.id);
+                    } else {
+                        // 仍在强制静止期内，定期清空位置缓冲区避免惯性污染
+                        if ((currentTime - phaseStartTime[i]) % 200 == 0) { // 每200ms清空一次
+                            // 将缓冲区的位置数据设为当前位置，消除惯性影响
+                            float currentPos = channel.motor_obj.position;
+                            for (int j = 0; j < ACTIVITY_BUFFER_SIZE; j++) {
+                                channel.activityBuffer[j].position = currentPos;
+                            }
+                        }
+                    }
+                    break;
+                    
+                case PHASE_RECOVERY_TRANSITION:
+                    // 阶段3：恢复过渡期 - 仅使用陀螺仪检测运动，避免被污染的位置数据影响
+                    if (g_gyroData.dataValid && gyroHasMovement) {
+                        // 陀螺仪检测到运动，进入完全恢复期
+                        detectionPhase[i] = PHASE_FULL_RECOVERY;
+                        phaseStartTime[i] = currentTime;
+                        standstillDetectionCount[i] = 1; // 恢复状态机
+                        
+                        Serial.printf("电机%d 陀螺仪检测到运动(X:%d, Y:%d, Z:%d)，进入PHASE_FULL_RECOVERY\n", 
+                                     channel.motor_obj.id, g_gyroData.x, g_gyroData.y, g_gyroData.z);
+                    } else if (!g_gyroData.dataValid) {
+                        // 如果陀螺仪数据无效，等待一段时间后直接恢复
+                        if (currentTime - phaseStartTime[i] >= 1000) { // 等待1秒
+                            detectionPhase[i] = PHASE_FULL_RECOVERY;
+                            phaseStartTime[i] = currentTime;
+                            standstillDetectionCount[i] = 1;
+                            
+                            Serial.printf("电机%d 陀螺仪无效，等待1秒后进入PHASE_FULL_RECOVERY\n", channel.motor_obj.id);
+                        }
+                    }
+                    break;
+                    
+                case PHASE_FULL_RECOVERY:
+                    // 阶段4：完全恢复 - 恢复正常的双重检测逻辑
+                    if (currentTime - phaseStartTime[i] >= 500) { // 完全恢复期持续0.5秒
+                        detectionPhase[i] = PHASE_NORMAL;
+                        Serial.printf("电机%d 完全恢复到PHASE_NORMAL\n", channel.motor_obj.id);
+                    }
+                    break;
             }
         }
         
@@ -450,42 +494,38 @@ void uartReceiveParseTask(void* parameter) {
 void analyzeActivityAndSetTorque(MotorChannel& channel) {
     int motor_index = channel.motor_obj.id - 1;
     
-    // 检查是否处于强制静止状态
-    if (forceStandstillState[motor_index]) {
-        if (millis() < forceStandstillEndTime[motor_index]) {
-            // 仍在强制静止期内，处理力矩衰减
-            channel.detectedActivity = ACTIVITY_STANDSTILL;
-            
-            // 处理阶梯式力矩衰减
-            if (torqueDecayActive[motor_index]) {
-                channel.target_torque = processStepwiseTorqueDecay(motor_index, torqueDecayActive[motor_index], 
-                                                                  torqueDecayStartValue[motor_index], 
-                                                                  torqueDecayStartTime[motor_index], "强制静止");
-                
-                // 检查衰减是否完成
-                if (channel.target_torque == 0.0f) {
-                    torqueDecayActive[motor_index] = false;
+    // 检查多阶段检测状态
+    if (detectionPhase[motor_index] != PHASE_NORMAL) {
+        switch (detectionPhase[motor_index]) {
+            case PHASE_FORCE_STANDSTILL:
+                // 强制静止期：处理力矩衰减
+                channel.detectedActivity = ACTIVITY_STANDSTILL;
+                if (torqueDecayActive[motor_index]) {
+                    channel.target_torque = processStepwiseTorqueDecay(motor_index, torqueDecayActive[motor_index], 
+                                                                      torqueDecayStartValue[motor_index], 
+                                                                      torqueDecayStartTime[motor_index], "强制静止");
+                    if (channel.target_torque == 0.0f) {
+                        torqueDecayActive[motor_index] = false;
+                    }
+                } else {
+                    channel.target_torque = 0.0f;
                 }
-            } else {
-                // 如果衰减未激活，直接设为0
+                return;
+                
+            case PHASE_RECOVERY_TRANSITION:
+            case PHASE_FULL_RECOVERY:
+                // 恢复过渡期和完全恢复期：保持静止状态，等待阶段结束
                 channel.target_torque = 0.0f;
-            }
-            
-            return; // 状态机无效化，直接返回
-        } else {
-            // 时间已到2秒，但需要等待陀螺仪检测到运动才能恢复
-            // 这里不自动恢复，由standstillDetectionTask检测运动后恢复
-            channel.target_torque = 0.0f;
-            channel.detectedActivity = ACTIVITY_STANDSTILL;
-            return; // 继续保持静止状态，等待运动信号
+                channel.detectedActivity = ACTIVITY_STANDSTILL;
+                return;
         }
     }
     
     float raw_target_torque = 0.0f;
     DetectedActivity previousActivity = channel.detectedActivity;
     
-    // 使用统一的位置检测方法：获取1.3s内的位置变化范围
-    float pos_range = getMotorPositionRange(channel, 30); // 26个样本 = 1.3s
+    // 使用统一的位置检测方法：获取位置变化范围
+    float pos_range = getMotorPositionRange(channel, 40); 
 
     // 基于位置变化范围判断运动状态
     if (pos_range > assistParams.MOVEMENT_THRESHOLD_CLIMB_STEEP) {
@@ -600,12 +640,12 @@ float processStepwiseTorqueDecay(int motor_index, bool isActive, float startValu
     const uint32_t STEP_INTERVAL = 500; // 每个阶梯
     const float STEP_SIZE = 3.0f; // 每个阶梯
     
-    // 计算当前应该在第几个阶梯
+    // 计算当前应该在第几个阶梯（从第1阶梯开始就减力）
     uint32_t stepCount = elapsedTime / STEP_INTERVAL;
     float initialTorque = abs(startValue); // 取绝对值计算
     
-    // 计算当前阶梯的目标力矩
-    float currentStepTorque = initialTorque - (stepCount * STEP_SIZE);
+    // 计算当前阶梯的目标力矩（第1阶梯就开始衰减）
+    float currentStepTorque = initialTorque - ((stepCount + 1) * STEP_SIZE);
     
     if (currentStepTorque <= 0.0f) {
         // 衰减完成，力矩设为0
@@ -623,9 +663,20 @@ float processStepwiseTorqueDecay(int motor_index, bool isActive, float startValu
         
         if (stepCount != lastPrintedStep[motor_index][sourceType]) {
             lastPrintedStep[motor_index][sourceType] = stepCount;
-            Serial.printf("电机%d %s阶梯式衰减 - 第%lu阶梯: %.2f -> %.2f Nm\n", 
+            // 计算本阶梯的起始值（前一个状态的力矩值）
+            float previousStepTorque = 0.0f;
+            if (stepCount == 0) {
+                // 第1阶梯，起始值就是初始力矩
+                previousStepTorque = initialTorque * targetSign;
+            } else {
+                // 后续阶梯，起始值是上一阶梯的结果
+                float prevStepValue = initialTorque - (stepCount * STEP_SIZE);
+                previousStepTorque = prevStepValue * targetSign;
+            }
+            
+            Serial.printf("电机%d %s阶梯式衰减 - 第%lu阶梯: %.2f -> %.2f Nm (减少%.1fNm)\n", 
                          motor_index + 1, source, stepCount + 1, 
-                         initialTorque * targetSign, resultTorque);
+                         previousStepTorque, resultTorque, abs(previousStepTorque - resultTorque));
         }
         
         return resultTorque;
