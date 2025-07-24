@@ -18,39 +18,21 @@
 #include <HardwareSerial.h>
 #include "rs01_motor.h"
 #include "gy25t_sensor.h"
+#include "ble_manager.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
-#include <BLEDevice.h>
-#include <BLEServer.h>
-#include <BLEUtils.h>
-#include <BLE2902.h>
 
-#define ACTIVITY_BUFFER_SIZE 40
+#define ACTIVITY_BUFFER_SIZE 30
 
 // ==================== 助力模式参数结构体 (支持动态修改) ===================
-struct AssistParameters {
-    volatile float MOVEMENT_THRESHOLD_WALK;
-    volatile float MOVEMENT_THRESHOLD_CLIMB;
-    volatile float MOVEMENT_THRESHOLD_CLIMB_STEEP;
-    volatile float ASSIST_TORQUE_WALK;
-    volatile float ASSIST_TORQUE_CLIMB;
-    volatile float ASSIST_TORQUE_CLIMB_STEEP;
-    volatile float TORQUE_SMOOTHING_FACTOR;
-    volatile bool INTERMITTENT_ENABLED;
-    volatile float INTERMITTENT_DUTY;
-    volatile float INTERMITTENT_REDUCTION;
-    volatile bool AUTO_DISABLE_ENABLED;
-};
+// AssistParameters结构体已在ble_manager.h中定义
 
 AssistParameters assistParams = {
-    0.3f, 0.6f, 0.8f, 3.0f, 5.5f, 8.0f, 0.2f, true, 0.5f, 0.1f, false
+    0.15f, 0.6f, 1.0f, 4.0f, 7.0f, 8.0f, 0.2f, true, 0.5f, 0.1f, false
 };
 
 // ==================== 核心数据结构与状态机 ===================
-enum UartCommandType { CMD_NONE, CMD_SET_TORQUE, CMD_REQUEST_DATA, CMD_CHANGE_MODE, CMD_ENABLE_MOTOR, CMD_DISABLE_MOTOR };
-enum SystemState { STATE_STANDBY, STATE_AUTO_ADAPT, STATE_EMERGENCY_STOP };
-enum DetectedActivity { ACTIVITY_UNKNOWN, ACTIVITY_STANDSTILL, ACTIVITY_WALKING, ACTIVITY_CLIMBING, ACTIVITY_CLIMBING_STEEP };
-struct ActivityDataPoint { float position; float current; };
+// 枚举和ActivityDataPoint已在ble_manager.h中定义
 struct MotorChannel {
     MI_Motor motor_obj;
     volatile SystemState systemState = STATE_STANDBY;
@@ -80,9 +62,7 @@ TaskHandle_t analysisTaskHandle = NULL;
 TaskHandle_t standstillDetectionTaskHandle = NULL;
 TaskHandle_t gyroUpdateTaskHandle = NULL;
 
-// 标志变量，用于主循环中处理BLE通信
-volatile bool shouldSendParams = false;
-volatile bool shouldSendMotorData = false;
+// BLE管理器实例在ble_manager.cpp中定义
 
 // 初始化完成标志，确保模式设置完成后才开始发送电流指令
 volatile bool motorInitializationComplete = false;
@@ -91,21 +71,14 @@ volatile bool motorInitializationComplete = false;
 volatile uint8_t standstillDetectionCount[2] = {1, 1}; // 静止检测次数标记，默认为1
 volatile bool forceStandstillState[2] = {false, false}; // 强制静止状态标志
 volatile uint32_t forceStandstillEndTime[2] = {0, 0};   // 强制静止状态结束时间
-volatile bool torqueDecayActive[2] = {false, false};    // 力矩衰减激活标志
+volatile bool torqueDecayActive[2] = {false, false};    // 力矩衰减激活标志（强制静止检测使用）
 volatile float torqueDecayStartValue[2] = {0.0f, 0.0f}; // 衰减开始时的力矩值
 volatile uint32_t torqueDecayStartTime[2] = {0, 0};     // 衰减开始时间
 
-// 平滑力矩变化相关变量
-volatile bool torqueTransitionActive[2] = {false, false};  // 力矩平滑过渡激活标志
-volatile float torqueTransitionStartValue[2] = {0.0f, 0.0f}; // 过渡开始时的力矩值
-volatile float torqueTransitionTargetValue[2] = {0.0f, 0.0f}; // 过渡目标力矩值
-volatile uint32_t torqueTransitionStartTime[2] = {0, 0};      // 过渡开始时间
-volatile const uint32_t TORQUE_TRANSITION_DURATION = 1000;    // 力矩过渡持续时间：800ms
-volatile const uint32_t FORCE_STANDSTILL_DURATION = 500;    // 强制静止持续时间：1秒
-volatile const uint32_t RECOVERY_WAIT_DURATION = 500;       // 恢复等待时间：200ms
-volatile const float TORQUE_CHANGE_THRESHOLD = 0.1f;        // 力矩变化阈值：0.5Nm
-volatile const int16_t EMERGENCY_MOTION_THRESHOLD = 300;     // 紧急运动检测阈值（陀螺仪）
-volatile const float EMERGENCY_POSITION_THRESHOLD = 0.9f;   // 紧急运动检测阈值（位置变化）
+// 状态机静止检测的力矩衰减控制变量
+volatile bool stateMachineTorqueDecayActive[2] = {false, false};    // 状态机力矩衰减激活标志
+volatile float stateMachineTorqueDecayStartValue[2] = {0.0f, 0.0f}; // 状态机衰减开始时的力矩值
+volatile uint32_t stateMachineTorqueDecayStartTime[2] = {0, 0};     // 状态机衰减开始时间
 
 // ==================== 函数声明 ===================
 void uartReceiveParseTask(void* parameter);
@@ -115,278 +88,34 @@ void standstillDetectionTask(void* parameter);
 void gyroUpdateTask(void* parameter);
 void analyzeActivityAndSetTorque(MotorChannel& channel);
 void motorDataCallback(MI_Motor* updated_motor);
-void sendMotorData();
-void sendConnectConfirmation();
-void sendAllData();
-void restartBLE();
-void startTorqueTransition(int motorIndex, float targetTorque);
-float getSmoothTorque(int motorIndex, float currentTorque);
+float processStepwiseTorqueDecay(int motor_index, bool isActive, float startValue, uint32_t startTime, const char* source);
+float getMotorPositionRange(MotorChannel& channel, int sampleCount = ACTIVITY_BUFFER_SIZE);
+bool gy25t_isStandstill();
 
-// ==================== BLE (蓝牙低功耗) 配置 ===================
-// 使用标准的UUID，增加兼容性
-#define SERVICE_UUID           "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
-#define PARAMS_CHAR_UUID       "beb5483e-36e1-4688-b7f5-ea07361b26a8"
-#define MOTOR_DATA_CHAR_UUID   "a8c8473c-1481-42a1-a734-71f3a223f3da"
-#define COMMAND_CHAR_UUID      "da1a9a2a-e149-4f35-a768-2a1b5351336c"
-
-BLEService *pService = NULL;
-BLECharacteristic *pParamsCharacteristic = NULL;
-BLECharacteristic *pMotorDataCharacteristic = NULL;
-BLECharacteristic *pCommandCharacteristic = NULL;
-bool deviceConnected = false;
-bool oldDeviceConnected = false;
-
-// 这是一个辅助函数，用于将当前参数打包成JSON字符串
-void getParamsJson(char* buffer, size_t bufferSize) {
-    snprintf(buffer, bufferSize,
-        "{\"walk_thresh\":%.2f, \"climb_thresh\":%.2f, \"steep_thresh\":%.2f, \"walk_torque\":%.2f, \"climb_torque\":%.2f, \"steep_torque\":%.2f, \"smooth_factor\":%.2f, \"intermittent_enabled\":%s, \"intermittent_duty\":%.2f, \"intermittent_reduction\":%.2f, \"auto_disable_enabled\":%s}",
-        assistParams.MOVEMENT_THRESHOLD_WALK, assistParams.MOVEMENT_THRESHOLD_CLIMB, assistParams.MOVEMENT_THRESHOLD_CLIMB_STEEP,
-        assistParams.ASSIST_TORQUE_WALK, assistParams.ASSIST_TORQUE_CLIMB, assistParams.ASSIST_TORQUE_CLIMB_STEEP,
-        assistParams.TORQUE_SMOOTHING_FACTOR, assistParams.INTERMITTENT_ENABLED ? "true" : "false",
-        assistParams.INTERMITTENT_DUTY, assistParams.INTERMITTENT_REDUCTION, assistParams.AUTO_DISABLE_ENABLED ? "true" : "false"
-    );
-}
-
-class MyServerCallbacks: public BLEServerCallbacks {
-    void onConnect(BLEServer* pServer) { 
-        deviceConnected = true; 
-        Serial.println("BLE设备已连接");
-        
-        // 连接后立即发送一次数据，帮助客户端识别特性
-        delay(100); // 给客户端一点时间准备
-        
-        // 先发送一个简单的连接确认消息
-        sendConnectConfirmation();
-        
-        // 然后设置标志位，主循环会发送正式数据
-        shouldSendParams = true;
-        shouldSendMotorData = true;
-    }
-    void onDisconnect(BLEServer* pServer) {
-        deviceConnected = false;
-        // 蓝牙断开连接时保持当前状态，不切换到待机
-        Serial.println("设备断开蓝牙连接，继续保持当前运行状态。");
-    }
-};
-
-// 添加一个通知回调类，用于监控通知状态
-class NotifyCallbacks: public BLEDescriptorCallbacks {
-    void onWrite(BLEDescriptor* pDescriptor) {
-        uint8_t* data = pDescriptor->getValue();
-        size_t length = pDescriptor->getLength();
-        
-        if (length > 0 && data != nullptr && data[0] == 0x01) {
-            Serial.println("客户端已订阅通知");
-        } else {
-            Serial.println("客户端已取消订阅通知");
-        }
-    }
-};
-
-class ParamsCharacteristicCallbacks: public BLECharacteristicCallbacks {
-    void onWrite(BLECharacteristic *pCharacteristic) {
-        String value = pCharacteristic->getValue().c_str();
-        if (value.length() > 0) {
-            int eqIndex = value.indexOf('=');
-            if (eqIndex != -1) {
-                String key = value.substring(0, eqIndex);
-                float val = value.substring(eqIndex + 1).toFloat();
-                
-                if (key == "walk_thresh") assistParams.MOVEMENT_THRESHOLD_WALK = val;
-                else if (key == "climb_thresh") assistParams.MOVEMENT_THRESHOLD_CLIMB = val;
-                else if (key == "steep_thresh") assistParams.MOVEMENT_THRESHOLD_CLIMB_STEEP = val;
-                else if (key == "walk_torque") assistParams.ASSIST_TORQUE_WALK = val;
-                else if (key == "climb_torque") assistParams.ASSIST_TORQUE_CLIMB = val;
-                else if (key == "steep_torque") assistParams.ASSIST_TORQUE_CLIMB_STEEP = val;
-                else if (key == "smooth_factor") assistParams.TORQUE_SMOOTHING_FACTOR = val;
-                else if (key == "auto_disable_enabled") assistParams.AUTO_DISABLE_ENABLED = (val > 0.5);
-                else if (key == "intermittent_enabled") assistParams.INTERMITTENT_ENABLED = (val > 0.5);
-                else if (key == "intermittent_duty") assistParams.INTERMITTENT_DUTY = constrain(val, 0.0, 1.0);
-                else if (key == "intermittent_reduction") assistParams.INTERMITTENT_REDUCTION = constrain(val, 0.0, 1.0);
-                
-                Serial.printf("通过蓝牙更新参数: %s = %.2f\n", key.c_str(), val);
-            }
-        }
-    }
-    
-    void onRead(BLECharacteristic *pCharacteristic) {
-        Serial.println("收到参数读取请求，发送当前参数");
-        // 使用静态缓冲区
-        static char paramsJson[512];
-        getParamsJson(paramsJson, sizeof(paramsJson));
-        pCharacteristic->setValue(paramsJson);
-    }
-};
-
-class CommandCharacteristicCallbacks: public BLECharacteristicCallbacks {
-    void onWrite(BLECharacteristic *pCharacteristic) {
-        String value = pCharacteristic->getValue().c_str();
-        if (value.length() > 0) {
-            Serial.printf("收到BLE指令: %s\n", value.c_str());
-
-            int separator = value.indexOf(',');
-            String cmdName = (separator == -1) ? value : value.substring(0, separator);
-            int motor_id = (separator == -1) ? 0 : value.substring(separator + 1).toInt();
-            int motor_index = motor_id - 1;
-
-            if (cmdName == "enable_motor" && motor_id >= 1 && motor_id <= 2) {
-                if(motorChannels[motor_index].systemState != STATE_EMERGENCY_STOP)
-                    motorChannels[motor_index].pending_web_cmd = CMD_ENABLE_MOTOR;
-            } else if (cmdName == "disable_motor" && motor_id >= 1 && motor_id <= 2) {
-                motorChannels[motor_index].systemState = STATE_STANDBY;
-                motorChannels[motor_index].target_torque = 0.0f;
-                motorChannels[motor_index].pending_web_cmd = CMD_DISABLE_MOTOR;
-            } else if (cmdName == "start_auto_adapt" && motor_id >= 1 && motor_id <= 2) {
-                if(motorChannels[motor_index].systemState == STATE_STANDBY){
-                    motorChannels[motor_index].systemState = STATE_AUTO_ADAPT;
-                    motorChannels[motor_index].pending_web_cmd = CMD_CHANGE_MODE;
-                    motorChannels[motor_index].pending_web_value = CUR_MODE;
-                }
-            } else if (cmdName == "stop_auto_adapt" && motor_id >= 1 && motor_id <= 2) {
-                if(motorChannels[motor_index].systemState == STATE_AUTO_ADAPT){
-                    motorChannels[motor_index].systemState = STATE_STANDBY;
-                    motorChannels[motor_index].target_torque = 0.0f;
-                }
-            } else if (cmdName == "emergency_stop") {
-                for(int i=0; i<2; i++){
-                    motorChannels[i].systemState = STATE_EMERGENCY_STOP;
-                    motorChannels[i].target_torque = 0.0f;
-                    motorChannels[i].pending_web_cmd = CMD_DISABLE_MOTOR;
-                }
-            } else if (cmdName == "reset_emergency_stop") {
-                 for(int i=0; i<2; i++){
-                    if (motorChannels[i].systemState == STATE_EMERGENCY_STOP) {
-                        motorChannels[i].systemState = STATE_STANDBY;
-                    }
-                }
-            } else if (cmdName == "get_params") {
-                // 设置一个标志，让主循环处理参数发送，避免在回调中执行
-                shouldSendParams = true;
-            } else if (cmdName == "get_motor_data") {
-                // 设置一个标志，让主循环处理数据发送，避免在回调中执行
-                shouldSendMotorData = true;
-            } else if (cmdName == "restart_ble") {
-                // 重启BLE连接
-                restartBLE();
-            }
-        }
-    }
-};
-
-class MotorDataCharacteristicCallbacks: public BLECharacteristicCallbacks {
-    void onRead(BLECharacteristic *pCharacteristic) {
-        Serial.println("收到电机数据读取请求，发送当前数据");
-        // 不在回调中直接发送数据，而是设置一个标志让主循环处理
-        shouldSendMotorData = true;
-    }
-};
-
-// 辅助函数，用于发送电机数据
-void sendMotorData() {
-    // 使用静态缓冲区以减少堆栈使用
-    static char motor1Json[256];
-    static char motor2Json[256];
-    static char finalJson[512];
-    
-    // 确保字符串初始化为空
-    motor1Json[0] = '\0';
-    motor2Json[0] = '\0';
-    finalJson[0] = '\0';
-    
-    for (int i = 0; i < 2; i++) {
-        const char* activityStr = "未知";
-        switch (motorChannels[i].detectedActivity) {
-            case ACTIVITY_STANDSTILL: activityStr = "静止"; break;
-            case ACTIVITY_WALKING: activityStr = "平地行走"; break;
-            case ACTIVITY_CLIMBING: activityStr = "爬楼"; break;
-            case ACTIVITY_CLIMBING_STEEP: activityStr = "大幅度爬楼"; break;
-            default: break;
-        }
-        char* targetBuffer = (i == 0) ? motor1Json : motor2Json;
-        
-        // 使用更严格的JSON格式，确保兼容性
-        snprintf(targetBuffer, 256,
-                "{\"id\":%d,\"position\":%.2f,\"current\":%.2f,\"error\":%d,\"systemState\":%d,\"emergencyStop\":%s,\"detectedActivity\":\"%s\",\"targetTorque\":%.2f}",
-                motorChannels[i].motor_obj.id, motorChannels[i].motor_obj.position, motorChannels[i].motor_obj.current, motorChannels[i].motor_obj.error,
-                (int)motorChannels[i].systemState, (motorChannels[i].systemState == STATE_EMERGENCY_STOP) ? "true" : "false",
-                activityStr, motorChannels[i].target_torque);
-    }
-    
-    // 标准JSON数组格式
-    snprintf(finalJson, sizeof(finalJson), "[%s,%s]", motor1Json, motor2Json);
-    
-    // 确保数据有效
-    if (strlen(finalJson) > 10) {
-        // 发送数据
-        pMotorDataCharacteristic->setValue(finalJson);
-        pMotorDataCharacteristic->notify();
-        
-        // 每10次打印一次调试信息，避免日志过多
-        static int debugCounter = 0;
-        if (++debugCounter >= 10) {
-            debugCounter = 0;
-            Serial.printf("电机数据已发送: %s\n", finalJson);
-        }
-    } else {
-        Serial.println("警告: 电机数据无效，跳过发送");
+// ==================== BLE接口函数实现 ===================
+void setMotorSystemState(int motor_index, SystemState state) {
+    if (motor_index >= 0 && motor_index < 2) {
+        motorChannels[motor_index].systemState = state;
     }
 }
 
-// 发送连接确认消息，帮助app识别设备
-void sendConnectConfirmation() {
-    // 在所有特性上发送简单的确认消息
-    const char* confirmMsg = "{\"status\":\"connected\",\"device\":\"exoskeleton\"}";
-    
-    if(pParamsCharacteristic != nullptr) {
-        pParamsCharacteristic->setValue(confirmMsg);
-        pParamsCharacteristic->notify();
-        delay(50);
-    }
-    
-    if(pMotorDataCharacteristic != nullptr) {
-        pMotorDataCharacteristic->setValue(confirmMsg);
-        pMotorDataCharacteristic->notify();
-    }
-    
-    Serial.println("已发送连接确认消息");
+void setMotorPendingCommand(int motor_index, UartCommandType cmd, float value) {
+    if (motor_index >= 0 && motor_index < 2) {
+        motorChannels[motor_index].pending_web_cmd = cmd;
+        motorChannels[motor_index].pending_web_value = value;
+    }  
 }
 
-// 添加一个主动发送所有数据的函数
-void sendAllData() {
-    if (!deviceConnected) return;
-    
-    Serial.println("主动发送所有数据...");
-    
-    // 发送参数
-    static char paramsJson[512];
-    getParamsJson(paramsJson, sizeof(paramsJson));
-    pParamsCharacteristic->setValue(paramsJson);
-    pParamsCharacteristic->notify();
-    delay(50);
-    
-    // 发送电机数据
-    sendMotorData();
-    
-    Serial.println("所有数据发送完成");
+SystemState getMotorSystemState(int motor_index) {
+    if (motor_index >= 0 && motor_index < 2) {
+        return motorChannels[motor_index].systemState;
+    }
+    return STATE_STANDBY;
 }
 
-void motorDataCallback(MI_Motor* updated_motor) {
-    if (updated_motor->id >= MOTER_1_ID && updated_motor->id <= MOTER_2_ID) {
-        int motor_index = updated_motor->id - 1;
-        MotorChannel& channel = motorChannels[motor_index];
-        channel.motor_obj.position = updated_motor->position;
-        channel.motor_obj.velocity = updated_motor->velocity;
-        channel.motor_obj.current = updated_motor->current;
-        // Note: The new MI_Motor struct uses a float for temperature.
-        // This might require a cast if the rest of the code expects a uint8_t.
-        // For now, we'll leave it as a direct assignment.
-        channel.motor_obj.temperature = updated_motor->temperature;
-        channel.motor_obj.error = updated_motor->error;
-        channel.activityBuffer[channel.activityBufferIndex].position = updated_motor->position;
-        channel.activityBuffer[channel.activityBufferIndex].current = updated_motor->current;
-        channel.activityBufferIndex = (channel.activityBufferIndex + 1) % ACTIVITY_BUFFER_SIZE;
-        if(updated_motor->id == MOTER_1_ID) { xSemaphoreGive(motor1DataReceivedSemaphore); } 
-        else { xSemaphoreGive(motor2DataReceivedSemaphore); }
+void setMotorTargetTorque(int motor_index, float torque) {
+    if (motor_index >= 0 && motor_index < 2) {
+        motorChannels[motor_index].target_torque = torque;
     }
 }
 
@@ -445,179 +174,33 @@ void setup() {
     motorInitializationComplete = true;
     Serial.println("电机初始化完成，现在可以安全发送电流指令.");
     
-    // 增加堆栈大小，配置BLE
-    Serial.println("启动BLE服务器...");
-    
-    // 增加BLE堆栈大小
-    esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
-    bt_cfg.controller_task_stack_size = 4096; // 默认是3072
-    esp_bt_controller_init(&bt_cfg);
-    
-    BLEDevice::init("登山外骨骼-BLE");
-    
-    // 设置MTU大小，确保数据包能够完整发送
-    BLEDevice::setMTU(512);
-    
-    BLEServer *pServer = BLEDevice::createServer();
-    pServer->setCallbacks(new MyServerCallbacks());
-    
-    // 创建服务前先清理旧服务
-    if(pService != nullptr) {
-        pService->stop();
-        delete pService;
-    }
-    
-    // 创建新服务
-    pService = pServer->createService(BLEUUID(SERVICE_UUID), 30, 0);  // 增加属性表大小
-
-    pParamsCharacteristic = pService->createCharacteristic(
-        PARAMS_CHAR_UUID,
-        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_INDICATE
-    );
-    pParamsCharacteristic->setCallbacks(new ParamsCharacteristicCallbacks());
-    BLE2902* params2902 = new BLE2902();
-    params2902->setCallbacks(new NotifyCallbacks());
-    // 不使用setNotifications，因为这个API可能不存在
-    pParamsCharacteristic->addDescriptor(params2902);
-
-    pMotorDataCharacteristic = pService->createCharacteristic(
-        MOTOR_DATA_CHAR_UUID,
-        BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_INDICATE
-    );
-    pMotorDataCharacteristic->setCallbacks(new MotorDataCharacteristicCallbacks());
-    BLE2902* motorData2902 = new BLE2902();
-    motorData2902->setCallbacks(new NotifyCallbacks());
-    // 不使用setNotifications，因为这个API可能不存在
-    pMotorDataCharacteristic->addDescriptor(motorData2902);
-
-    pCommandCharacteristic = pService->createCharacteristic(
-        COMMAND_CHAR_UUID,
-        BLECharacteristic::PROPERTY_WRITE
-    );
-    pCommandCharacteristic->setCallbacks(new CommandCharacteristicCallbacks());
-
-    pService->start();
-
-    BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
-    pAdvertising->addServiceUUID(SERVICE_UUID);
-    pAdvertising->setScanResponse(true);
-    pAdvertising->setMinPreferred(0x06);  // 连接的优先级，帮助iPhone连接
-    pAdvertising->setMinPreferred(0x12);  // 连接的优先级，帮助iPhone连接
-    
-    // 设置广播数据以增强兼容性
-    BLEAdvertisementData advData;
-    advData.setFlags(0x06); // BR_EDR_NOT_SUPPORTED | LE General Discoverable Mode
-    advData.setCompleteServices(BLEUUID(SERVICE_UUID));
-    
-    // 使用一个简短且易识别的设备名
-    advData.setName("外骨骼-BLE");
-    
-    // 添加制造商数据，包含一个简单标识符，帮助app识别
-    uint8_t manData[4] = {0xA1, 0xB2, 0xC3, 0xD4}; // 唯一标识
-    advData.setManufacturerData(std::string((char*)manData, 4));
-    
-    pAdvertising->setAdvertisementData(advData);
-    
-    // 设置扫描响应数据，提供更多信息
-    BLEAdvertisementData scanResponse;
-    scanResponse.setName("登山外骨骼-BLE");
-    
-    // 可以添加其他信息，如电源类型、版本号等
-    uint8_t powerData[1] = {0x03}; // 0x03 表示使用电池供电
-    scanResponse.setServiceData(BLEUUID((uint16_t)0x180F), std::string((char*)powerData, 1)); // 0x180F 是电池服务UUID
-    
-    pAdvertising->setScanResponseData(scanResponse);
-    
-    BLEDevice::startAdvertising();
-    Serial.println("BLE广播已开始。");
+    // 初始化BLE管理器
+    bleManager.init();
 }
 
-// 重启BLE连接的函数
-void restartBLE() {
-    Serial.println("正在重启BLE连接...");
-    
-    // 停止广播
-    BLEDevice::stopAdvertising();
-    
-    // 断开所有连接
-    if (deviceConnected) {
-        // 通知客户端我们即将断开
-        pMotorDataCharacteristic->setValue("正在重启BLE连接，请稍后重新连接");
-        pMotorDataCharacteristic->notify();
-        delay(500);
-        
-        // 强制断开连接
-        deviceConnected = false;
-        oldDeviceConnected = false;
-    }
-    
-    // 重新启动广播
-    BLEDevice::startAdvertising();
-    Serial.println("BLE已重启，等待新的连接...");
-}
-
-// 在loop函数中添加自动重连机制
+// 在loop函数中添加BLE管理
 void loop() {
-    // 添加BLE连接监控
-    static unsigned long lastConnectedTime = 0;
-    static bool wasConnected = false;
+    // 添加BLE连接监控（不自动重启）
     static unsigned long lastForceSendTime = 0;
     
-    if (deviceConnected) {
-        lastConnectedTime = millis();
-        wasConnected = true;
-        
+    if (bleManager.isConnected()) {
         // 每5秒主动发送一次所有数据，确保app能接收到
         if (millis() - lastForceSendTime > 5000) {
-            sendAllData();
+            bleManager.sendAllData();
             lastForceSendTime = millis();
-        }
-    } else if (wasConnected && millis() - lastConnectedTime > 10000) {
-        // 如果曾经连接过，但断开超过10秒，尝试重启BLE
-        wasConnected = false;
-        restartBLE();
-    }
-    
-    // 修改蓝牙连接检测逻辑
-    if (!deviceConnected && oldDeviceConnected) {
-        delay(500); // 给BLE堆栈时间处理断开事件
-        oldDeviceConnected = deviceConnected;
-        Serial.println("设备已断开蓝牙连接");
-        BLEDevice::startAdvertising();
-    }
-    
-    if (deviceConnected && !oldDeviceConnected) {
-        oldDeviceConnected = deviceConnected;
-        Serial.println("设备已通过蓝牙连接");
-        shouldSendParams = true; // 连接时发送参数
-    }
-
-    // 处理BLE通信标志
-    if (deviceConnected) {
-        // 处理参数发送请求
-        if (shouldSendParams) {
-            static char paramsJson[512];
-            getParamsJson(paramsJson, sizeof(paramsJson));
-            pParamsCharacteristic->setValue(paramsJson);
-            pParamsCharacteristic->notify();
-            Serial.println("已通过蓝牙发送参数。");
-            shouldSendParams = false;
-        }
-        
-        // 处理电机数据发送请求
-        if (shouldSendMotorData) {
-            sendMotorData();
-            Serial.println("已通过蓝牙发送电机数据。");
-            shouldSendMotorData = false;
         }
         
         // 定期发送电机数据
         static unsigned long lastNotifyTime = 0;
         if (millis() - lastNotifyTime > 500) {
-            sendMotorData();
+            bleManager.setShouldSendMotorData(true);
             lastNotifyTime = millis();
         }
     }
+    
+    // 处理BLE管理器的循环逻辑
+    bleManager.handleLoop();
+    
     vTaskDelay(pdMS_TO_TICKS(10));
 }
 
@@ -678,15 +261,20 @@ void uartTransmitManagerTask(void* parameter) {
         
         // 1. 处理一次性指令 (来自Web/蓝牙)
         if (channel.pending_web_cmd != CMD_NONE) {
+            Serial.printf("uartTransmitManagerTask: 电机%d执行命令 cmd=%d, value=%.0f\n", 
+                         next_motor_to_poll, (int)channel.pending_web_cmd, channel.pending_web_value);
             switch(channel.pending_web_cmd) {
                 case CMD_ENABLE_MOTOR: 
                     Motor_Enable(motor_to_poll); 
+                    Serial.printf("电机%d已使能\n", next_motor_to_poll);
                     break;
                 case CMD_DISABLE_MOTOR: 
                     Motor_Reset(motor_to_poll, 0); // The new Motor_Reset function requires a second argument.
+                    Serial.printf("电机%d已禁用\n", next_motor_to_poll);
                     break;
                 case CMD_CHANGE_MODE: 
                     Change_Mode(motor_to_poll, (uint8_t)channel.pending_web_value);
+                    Serial.printf("电机%d已切换到模式%d\n", next_motor_to_poll, (int)channel.pending_web_value);
                     break;
                 default: 
                     break;
@@ -765,106 +353,78 @@ void uartTransmitManagerTask(void* parameter) {
 
 void standstillDetectionTask(void* parameter) {
     TickType_t lastWakeTime = xTaskGetTickCount();
-    const TickType_t frequency = pdMS_TO_TICKS(500); // 每0.5秒检查一次，提高响应速度
+    const TickType_t frequency = pdMS_TO_TICKS(100); // 每0.1秒检查一次，提高响应速度
     
     for (;;) {
-        // 检查陀螺仪数据有效性
+        // 先检查电机位置静止状态
+        bool motorPositionStandstill[2] = {false, false};
+        
+        for (int i = 0; i < 2; i++) {
+            MotorChannel& channel = motorChannels[i];
+            // 使用位置变化范围进行检测，
+            float pos_range_500ms = getMotorPositionRange(channel, 15);
+            motorPositionStandstill[i] = (pos_range_500ms < 0.20f);
+        }
+        
+        // 再检查陀螺仪静止状态（使用滑动窗口）
+        bool gyroStandstill = gy25t_isStandstill();
+        
+        // 检查陀螺仪数据有效性决定使用的检测策略
         if (!g_gyroData.dataValid) {
-            // 如果陀螺仪数据无效，回退到原来的电机位置检测逻辑
+            // 如果陀螺仪数据无效，只使用电机位置检测
             for (int i = 0; i < 2; i++) {
                 MotorChannel& channel = motorChannels[i];
                 
-                float min_position = channel.activityBuffer[0].position;
-                float max_position = channel.activityBuffer[0].position;
-                
-                for (int j = 0; j < ACTIVITY_BUFFER_SIZE; j++) {
-                    float pos = channel.activityBuffer[j].position;
-                    if (pos < min_position) min_position = pos;
-                    if (pos > max_position) max_position = pos;
-                }
-                
-                float position_range = max_position - min_position;
-                
-                // 检查是否有紧急位置变化，可以立即打断强制静止状态
-                if (position_range > EMERGENCY_POSITION_THRESHOLD && forceStandstillState[i]) {
-                    forceStandstillState[i] = false;
-                    torqueDecayActive[i] = false;
-                    standstillDetectionCount[i] = 1;
-                    Serial.printf("电机%d 紧急位置变化检测(变化范围: %.4f)，立即打断强制静止状态\n", 
-                                 channel.motor_obj.id, position_range);
-                }
-                
-                if (position_range <= 0.15f && standstillDetectionCount[i] == 0 && !forceStandstillState[i]) {
-                    // 基于位置检测到静止，且标记为0时，触发强制静止状态
+                if (motorPositionStandstill[i] && standstillDetectionCount[i] == 0 && !forceStandstillState[i]) {
+                    // 仅基于位置检测到静止，且标记为0时，触发强制静止状态
                     forceStandstillState[i] = true;
-                    forceStandstillEndTime[i] = millis() + FORCE_STANDSTILL_DURATION;
+                    forceStandstillEndTime[i] = millis() + 500;
                     channel.detectedActivity = ACTIVITY_STANDSTILL;
                     
-                    // 启动1秒力矩平滑衰减
+                    // 启动力矩衰减
                     torqueDecayActive[i] = true;
                     torqueDecayStartValue[i] = channel.target_torque; // 记录当前力矩值
                     torqueDecayStartTime[i] = millis();
                     
-                    Serial.printf("电机%d 基于位置检测到静止(变化范围: %.4f)，开始1秒力矩衰减(从%.2f到0)\n", 
-                                 channel.motor_obj.id, position_range, channel.target_torque);
+                    Serial.printf("电机%d 基于0.5s位置检测到静止(变化范围: %.4f < 0.15)，开始阶梯式力矩衰减(从%.2f到0，每0.3秒降低2Nm)\n", 
+                                 channel.motor_obj.id, getMotorPositionRange(channel, 10), channel.target_torque);
                 }
             }
         } else {
-            // 使用陀螺仪数据进行静止检测
-            int16_t abs_x = abs(g_gyroData.x);
-            int16_t abs_y = abs(g_gyroData.y);
-            int16_t abs_z = abs(g_gyroData.z);
-            
-            // 检查是否静止：三个轴的绝对值都小于100
-            bool isStandstill = (abs_x < 100) && (abs_y < 100) && (abs_z < 100);
-            
-            // 检查是否有紧急运动：任一轴超过紧急阈值
-            bool hasEmergencyMotion = (abs_x > EMERGENCY_MOTION_THRESHOLD) || 
-                                    (abs_y > EMERGENCY_MOTION_THRESHOLD) || 
-                                    (abs_z > EMERGENCY_MOTION_THRESHOLD);
-            
-            // 优先检查紧急运动，可以立即打断强制静止状态
-            if (hasEmergencyMotion) {
-                for (int i = 0; i < 2; i++) {
-                    if (forceStandstillState[i]) {
-                        forceStandstillState[i] = false;
-                        torqueDecayActive[i] = false;
-                        standstillDetectionCount[i] = 1;
-                        Serial.printf("紧急运动检测 - X:%d, Y:%d, Z:%d，立即打断电机%d强制静止状态\n", 
-                                     g_gyroData.x, g_gyroData.y, g_gyroData.z, motorChannels[i].motor_obj.id);
-                    }
-                }
-            }
-            
-            if (isStandstill) {
-                // 陀螺仪检测到静止状态
+            // 陀螺仪数据有效，使用双重检测：需要电机位置和陀螺仪同时检测到静止
+            if (gyroStandstill) {
+                // 陀螺仪检测到静止状态，再检查电机位置
                 for (int i = 0; i < 2; i++) {
                     MotorChannel& channel = motorChannels[i];
                     
-                    // 当次数标记为0时，触发强制2秒静止状态
-                    if (standstillDetectionCount[i] == 0 && !forceStandstillState[i]) {
+                    // 需要同时满足：陀螺仪静止 + 电机位置静止 + 标记为0 + 未处于强制静止状态
+                    if (motorPositionStandstill[i] && standstillDetectionCount[i] == 0 && !forceStandstillState[i]) {
                         forceStandstillState[i] = true;
-                        forceStandstillEndTime[i] = millis() + FORCE_STANDSTILL_DURATION;
+                        forceStandstillEndTime[i] = millis() + 500;
                         channel.detectedActivity = ACTIVITY_STANDSTILL;
                         
-                        // 启动1秒力矩平滑衰减
+                        // 启动力矩衰减
                         torqueDecayActive[i] = true;
                         torqueDecayStartValue[i] = channel.target_torque; // 记录当前力矩值
                         torqueDecayStartTime[i] = millis();
                         
-                        Serial.printf("陀螺仪检测到静止 - X:%d, Y:%d, Z:%d，电机%d开始1秒力矩衰减(从%.2f到0)\n", 
-                                     g_gyroData.x, g_gyroData.y, g_gyroData.z, channel.motor_obj.id, channel.target_torque);
+                        Serial.printf("双重检测到静止 - 陀螺仪(X:%d, Y:%d, Z:%d) + 0.5s位置检测(变化范围: %.4f < 0.15)，电机%d开始阶梯式力矩衰减(从%.2f到0，每0.3秒降低2Nm)\n", 
+                                     g_gyroData.x, g_gyroData.y, g_gyroData.z, getMotorPositionRange(channel, 10), channel.motor_obj.id, channel.target_torque);
                     }
                 }
             } else {
                 // 陀螺仪检测到运动 - 检查是否需要恢复状态机
+                int16_t abs_x = abs(g_gyroData.x);
+                int16_t abs_y = abs(g_gyroData.y);
+                int16_t abs_z = abs(g_gyroData.z);
                 bool hasMovement = (abs_x >= 100) || (abs_y >= 100) || (abs_z >= 100);
+                
                 if (hasMovement) {
                     for (int i = 0; i < 2; i++) {
                         MotorChannel& channel = motorChannels[i];
                         
-                        // 如果处于强制静止状态且时间已超过1秒，等待200ms后恢复状态机
-                        if (forceStandstillState[i] && millis() >= (forceStandstillEndTime[i] + RECOVERY_WAIT_DURATION)) {
+                        // 如果处于强制静止状态且时间已超过，等待后恢复状态机
+                        if (forceStandstillState[i] && millis() >= (forceStandstillEndTime[i] + 2000)) {
                             forceStandstillState[i] = false;
                             torqueDecayActive[i] = false; // 确保衰减标志也被清除
                             standstillDetectionCount[i] = 1;
@@ -896,20 +456,15 @@ void analyzeActivityAndSetTorque(MotorChannel& channel) {
             // 仍在强制静止期内，处理力矩衰减
             channel.detectedActivity = ACTIVITY_STANDSTILL;
             
-            // 处理1秒力矩平滑衰减
+            // 处理阶梯式力矩衰减
             if (torqueDecayActive[motor_index]) {
-                uint32_t elapsedTime = millis() - torqueDecayStartTime[motor_index];
-                const uint32_t DECAY_DURATION = 1000; // 1秒
+                channel.target_torque = processStepwiseTorqueDecay(motor_index, torqueDecayActive[motor_index], 
+                                                                  torqueDecayStartValue[motor_index], 
+                                                                  torqueDecayStartTime[motor_index], "强制静止");
                 
-                if (elapsedTime < DECAY_DURATION) {
-                    // 线性衰减：从初始值平滑降到0
-                    float decayProgress = (float)elapsedTime / DECAY_DURATION;
-                    channel.target_torque = torqueDecayStartValue[motor_index] * (1.0f - decayProgress);
-                } else {
-                    // 衰减完成，力矩设为0
-                    channel.target_torque = 0.0f;
+                // 检查衰减是否完成
+                if (channel.target_torque == 0.0f) {
                     torqueDecayActive[motor_index] = false;
-                    Serial.printf("电机%d 力矩衰减完成，力矩已降至0\n", channel.motor_obj.id);
                 }
             } else {
                 // 如果衰减未激活，直接设为0
@@ -929,15 +484,8 @@ void analyzeActivityAndSetTorque(MotorChannel& channel) {
     float raw_target_torque = 0.0f;
     DetectedActivity previousActivity = channel.detectedActivity;
     
-    // 使用最初的缓冲区变化逻辑：分析2秒内的位置变化范围
-    float max_pos = -1000.0f, min_pos = 1000.0f;
-    int current_idx = channel.activityBufferIndex;
-    for (int i = 0; i < ACTIVITY_BUFFER_SIZE; i++) {
-        current_idx = (current_idx == 0) ? (ACTIVITY_BUFFER_SIZE - 1) : (current_idx - 1);
-        if (channel.activityBuffer[current_idx].position > max_pos) max_pos = channel.activityBuffer[current_idx].position;
-        if (channel.activityBuffer[current_idx].position < min_pos) min_pos = channel.activityBuffer[current_idx].position;
-    }
-    float pos_range = max_pos - min_pos;
+    // 使用统一的位置检测方法：获取1.3s内的位置变化范围
+    float pos_range = getMotorPositionRange(channel, 30); // 26个样本 = 1.3s
 
     // 基于位置变化范围判断运动状态
     if (pos_range > assistParams.MOVEMENT_THRESHOLD_CLIMB_STEEP) {
@@ -951,7 +499,30 @@ void analyzeActivityAndSetTorque(MotorChannel& channel) {
         raw_target_torque = (channel.motor_obj.id == MOTER_1_ID) ? -assistParams.ASSIST_TORQUE_WALK : assistParams.ASSIST_TORQUE_WALK;
     } else {
         channel.detectedActivity = ACTIVITY_STANDSTILL;
-        raw_target_torque = 0.0f;
+        
+        // 检查是否需要启动阶梯式力矩衰减
+        if (!stateMachineTorqueDecayActive[motor_index] && abs(channel.target_torque) > 0.1f) {
+            // 首次检测到静止且当前有力矩输出，启动阶梯式衰减
+            stateMachineTorqueDecayActive[motor_index] = true;
+            stateMachineTorqueDecayStartValue[motor_index] = channel.target_torque;
+            stateMachineTorqueDecayStartTime[motor_index] = millis();
+            Serial.printf("电机%d 状态机检测到静止，启动阶梯式力矩衰减(从%.2f到0，每0.3秒降低2Nm)\n", 
+                         channel.motor_obj.id, channel.target_torque);
+        }
+        
+        // 处理阶梯式力矩衰减
+        if (stateMachineTorqueDecayActive[motor_index]) {
+            raw_target_torque = processStepwiseTorqueDecay(motor_index, stateMachineTorqueDecayActive[motor_index], 
+                                                          stateMachineTorqueDecayStartValue[motor_index], 
+                                                          stateMachineTorqueDecayStartTime[motor_index], "状态机");
+            
+            // 检查衰减是否完成
+            if (raw_target_torque == 0.0f) {
+                stateMachineTorqueDecayActive[motor_index] = false;
+            }
+        } else {
+            raw_target_torque = 0.0f;
+        }
     }
 
     if (previousActivity != channel.detectedActivity) {
@@ -961,21 +532,22 @@ void analyzeActivityAndSetTorque(MotorChannel& channel) {
             channel.activityChanged = true;
             channel.activityChangeTime = millis();
             channel.lastActivity = previousActivity;
-            Serial.printf("电机%d 检测到运动变化，标记设为0\n", channel.motor_obj.id);
+            
+            // 重置状态机的力矩衰减标志
+            stateMachineTorqueDecayActive[motor_index] = false;
+            
+            Serial.printf("电机%d 检测到运动变化，标记设为0，重置状态机衰减\n", channel.motor_obj.id);
         }
         
-        // 启动平滑过渡到新的目标力矩（内部会检查变化阈值）
-        startTorqueTransition(motor_index, raw_target_torque);
+        // 直接设置目标力矩
+        channel.target_torque = raw_target_torque;
     } else {
         // 即使活动状态没变，也检查力矩是否需要调整（如参数变化）
         float currentTargetTorque = channel.target_torque;
-        if (!torqueTransitionActive[motor_index] && abs(raw_target_torque - currentTargetTorque) >= TORQUE_CHANGE_THRESHOLD) {
-            startTorqueTransition(motor_index, raw_target_torque);
+        if (abs(raw_target_torque - currentTargetTorque) >= 0.1f) {
+            channel.target_torque = raw_target_torque;
         }
     }
-
-    // 应用平滑过渡的力矩值
-    channel.target_torque = getSmoothTorque(motor_index, channel.target_torque);
     if (abs(channel.target_torque) < 0.01) {
         channel.target_torque = 0.0f;
     }
@@ -984,7 +556,7 @@ void analyzeActivityAndSetTorque(MotorChannel& channel) {
 // ==================== GY25T陀螺仪更新任务 ===================
 void gyroUpdateTask(void* parameter) {
     TickType_t lastWakeTime = xTaskGetTickCount();
-    const TickType_t frequency = pdMS_TO_TICKS(50); // 20Hz更新频率(50ms)
+    const TickType_t frequency = pdMS_TO_TICKS(100); // 100ms
     
     unsigned long lastPrintTime = 0;
     const unsigned long printInterval = 1000; // 每秒打印一次数据
@@ -1009,52 +581,126 @@ void gyroUpdateTask(void* parameter) {
     }
 }
 
-// ==================== 平滑力矩变化功能实现 ===================
-void startTorqueTransition(int motorIndex, float targetTorque) {
-    float torqueDifference = abs(targetTorque - motorChannels[motorIndex].target_torque);
-    
-    // 如果力矩变化小于阈值，不启动平滑过渡，直接设置目标值
-    if (torqueDifference < TORQUE_CHANGE_THRESHOLD) {
-        motorChannels[motorIndex].target_torque = targetTorque;
-        return;
+// ==================== 阶梯式力矩衰减函数 ===================
+/**
+ * 处理阶梯式力矩衰减
+ * @param motor_index 电机索引 (0或1)
+ * @param isActive 衰减是否激活
+ * @param startValue 衰减开始时的力矩值
+ * @param startTime 衰减开始时间
+ * @param source 调用来源（用于日志标识）
+ * @return 当前应该输出的力矩值
+ */
+float processStepwiseTorqueDecay(int motor_index, bool isActive, float startValue, uint32_t startTime, const char* source) {
+    if (!isActive) {
+        return 0.0f;
     }
     
-    torqueTransitionActive[motorIndex] = true;
-    torqueTransitionStartValue[motorIndex] = motorChannels[motorIndex].target_torque;
-    torqueTransitionTargetValue[motorIndex] = targetTorque;
-    torqueTransitionStartTime[motorIndex] = millis();
+    uint32_t elapsedTime = millis() - startTime;
+    const uint32_t STEP_INTERVAL = 500; // 每个阶梯
+    const float STEP_SIZE = 3.0f; // 每个阶梯
     
-    Serial.printf("电机%d 开始力矩平滑过渡: %.2f -> %.2f (800ms)\n", 
-                 motorChannels[motorIndex].motor_obj.id, 
-                 torqueTransitionStartValue[motorIndex], 
-                 targetTorque);
+    // 计算当前应该在第几个阶梯
+    uint32_t stepCount = elapsedTime / STEP_INTERVAL;
+    float initialTorque = abs(startValue); // 取绝对值计算
+    
+    // 计算当前阶梯的目标力矩
+    float currentStepTorque = initialTorque - (stepCount * STEP_SIZE);
+    
+    if (currentStepTorque <= 0.0f) {
+        // 衰减完成，力矩设为0
+        Serial.printf("电机%d %s阶梯式力矩衰减完成，力矩已降至0 (总用时: %lums)\n", 
+                     motor_index + 1, source, elapsedTime);
+        return 0.0f;
+    } else {
+        // 保持符号，应用当前阶梯的力矩值
+        float targetSign = (startValue >= 0) ? 1.0f : -1.0f;
+        float resultTorque = currentStepTorque * targetSign;
+        
+        // 每次进入新阶梯时打印信息 - 使用静态变量区分不同来源
+        static uint32_t lastPrintedStep[2][2] = {{0, 0}, {0, 0}}; // [motor_index][source_type]
+        int sourceType = (strcmp(source, "状态机") == 0) ? 0 : 1; // 0:状态机, 1:强制静止
+        
+        if (stepCount != lastPrintedStep[motor_index][sourceType]) {
+            lastPrintedStep[motor_index][sourceType] = stepCount;
+            Serial.printf("电机%d %s阶梯式衰减 - 第%lu阶梯: %.2f -> %.2f Nm\n", 
+                         motor_index + 1, source, stepCount + 1, 
+                         initialTorque * targetSign, resultTorque);
+        }
+        
+        return resultTorque;
+    }
 }
 
-float getSmoothTorque(int motorIndex, float currentTorque) {
-    if (!torqueTransitionActive[motorIndex]) {
-        return currentTorque;
+// ==================== 电机位置变化范围计算函数 ===================
+/**
+ * 计算电机位置变化范围
+ * @param channel 电机通道对象
+ * @param sampleCount 要分析的样本数量（默认40=2秒，10=500ms）
+ * @return 指定时间范围内的位置变化范围
+ */
+float getMotorPositionRange(MotorChannel& channel, int sampleCount) {
+    // 确保样本数量不超过缓冲区大小
+    if (sampleCount > ACTIVITY_BUFFER_SIZE) sampleCount = ACTIVITY_BUFFER_SIZE;
+    if (sampleCount <= 0) sampleCount = 1;
+    
+    // 分析指定样本数量内的位置变化范围
+    float max_pos = -1000.0f, min_pos = 1000.0f;
+    int current_idx = channel.activityBufferIndex;
+    
+    for (int i = 0; i < sampleCount; i++) {
+        current_idx = (current_idx == 0) ? (ACTIVITY_BUFFER_SIZE - 1) : (current_idx - 1);
+        if (channel.activityBuffer[current_idx].position > max_pos) max_pos = channel.activityBuffer[current_idx].position;
+        if (channel.activityBuffer[current_idx].position < min_pos) min_pos = channel.activityBuffer[current_idx].position;
     }
     
-    uint32_t elapsedTime = millis() - torqueTransitionStartTime[motorIndex];
-    
-    if (elapsedTime >= TORQUE_TRANSITION_DURATION) {
-        // 过渡完成
-        torqueTransitionActive[motorIndex] = false;
-        float finalTorque = torqueTransitionTargetValue[motorIndex];
-        Serial.printf("电机%d 力矩平滑过渡完成: %.2f\n", 
-                     motorChannels[motorIndex].motor_obj.id, finalTorque);
-        return finalTorque;
+    return max_pos - min_pos;
+}
+
+bool gy25t_isStandstill() {
+    // 如果窗口未满，不能判断静止状态
+    if (!g_gyroWindow.windowFull) {
+        return false;
     }
     
-    // 计算过渡进度 (0.0 到 1.0)
-    float progress = (float)elapsedTime / TORQUE_TRANSITION_DURATION;
+    // 检查所有5个点的xyz绝对值是否都小于100
+    for (int i = 0; i < GYRO_WINDOW_SIZE; i++) {
+        if (abs(g_gyroWindow.x_samples[i]) >= GYRO_STANDSTILL_THRESHOLD ||
+            abs(g_gyroWindow.y_samples[i]) >= GYRO_STANDSTILL_THRESHOLD ||
+            abs(g_gyroWindow.z_samples[i]) >= GYRO_STANDSTILL_THRESHOLD) {
+            return false; // 发现运动
+        }
+    }
     
-    // 使用三次缓动函数实现更平滑的过渡
-    float smoothProgress = progress * progress * (3.0f - 2.0f * progress);
-    
-    // 线性插值计算当前力矩值
-    float smoothTorque = torqueTransitionStartValue[motorIndex] + 
-                        (torqueTransitionTargetValue[motorIndex] - torqueTransitionStartValue[motorIndex]) * smoothProgress;
-    
-    return smoothTorque;
+    return true; // 所有点都满足静止条件
+}
+
+void motorDataCallback(MI_Motor* updated_motor) {
+    if (updated_motor->id >= MOTER_1_ID && updated_motor->id <= MOTER_2_ID) {
+        int motor_index = updated_motor->id - 1;
+        MotorChannel& channel = motorChannels[motor_index];
+        channel.motor_obj.position = updated_motor->position;
+        channel.motor_obj.velocity = updated_motor->velocity;
+        channel.motor_obj.current = updated_motor->current;
+        channel.motor_obj.temperature = updated_motor->temperature;
+        channel.motor_obj.error = updated_motor->error;
+        
+        // 更新活动缓冲区
+        channel.activityBuffer[channel.activityBufferIndex].position = updated_motor->position;
+        channel.activityBuffer[channel.activityBufferIndex].current = updated_motor->current;
+        channel.activityBufferIndex = (channel.activityBufferIndex + 1) % ACTIVITY_BUFFER_SIZE;
+        
+        // 同步数据到BLE管理器
+        bleManager.updateMotorData(motor_index, updated_motor->position, updated_motor->current, updated_motor->error);
+        bleManager.syncMotorState(motor_index, channel.systemState, channel.detectedActivity, channel.target_torque);
+        
+        // BLE命令现在直接操作motorChannels，不需要额外同步
+        
+        // 释放信号量
+        if(updated_motor->id == MOTER_1_ID) { 
+            xSemaphoreGive(motor1DataReceivedSemaphore); 
+        } else { 
+            xSemaphoreGive(motor2DataReceivedSemaphore); 
+        }
+    }
 }

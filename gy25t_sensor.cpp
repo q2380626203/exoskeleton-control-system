@@ -2,6 +2,7 @@
 
 // 全局变量定义
 GyroRawData g_gyroData = {0, 0, 0, 0, false};
+GyroWindowData g_gyroWindow = {{0}, {0}, {0}, {0}, 0, false, 0};
 HardwareSerial gy25tSerial(GY25T_SERIAL_NUM); // 使用UART2
 
 // 数据接收缓冲区
@@ -23,6 +24,12 @@ void gy25t_init() {
     g_gyroData.z = 0;
     g_gyroData.lastUpdateTime = 0;
     g_gyroData.dataValid = false;
+    
+    // 初始化滑动窗口
+    memset(&g_gyroWindow, 0, sizeof(GyroWindowData));
+    g_gyroWindow.currentIndex = 0;
+    g_gyroWindow.windowFull = false;
+    g_gyroWindow.lastSampleTime = 0;
     
     bufferIndex = 0;
     
@@ -126,6 +133,9 @@ bool gy25t_parsePacket(uint8_t* buffer, int length) {
     g_gyroData.lastUpdateTime = millis();
     g_gyroData.dataValid = true;
     
+    // 更新滑动窗口
+    gy25t_updateWindow();
+    
     // Serial.println("=== GY25T数据包解析成功 ===");
     return true;
 }
@@ -146,3 +156,31 @@ void gy25t_printData() {
         Serial.println("陀螺仪数据无效");
     }
 }
+
+void gy25t_updateWindow() {
+    uint32_t currentTime = millis();
+    
+    // 检查是否到了采样时间（100ms间隔）
+    if (!g_gyroData.dataValid || 
+        (g_gyroWindow.lastSampleTime != 0 && 
+         currentTime - g_gyroWindow.lastSampleTime < GYRO_SAMPLE_INTERVAL_MS)) {
+        return;
+    }
+    
+    // 更新滑动窗口数据
+    g_gyroWindow.x_samples[g_gyroWindow.currentIndex] = g_gyroData.x;
+    g_gyroWindow.y_samples[g_gyroWindow.currentIndex] = g_gyroData.y;
+    g_gyroWindow.z_samples[g_gyroWindow.currentIndex] = g_gyroData.z;
+    g_gyroWindow.timestamps[g_gyroWindow.currentIndex] = currentTime;
+    
+    // 更新索引
+    g_gyroWindow.currentIndex = (g_gyroWindow.currentIndex + 1) % GYRO_WINDOW_SIZE;
+    
+    // 检查窗口是否已满
+    if (!g_gyroWindow.windowFull && g_gyroWindow.currentIndex == 0) {
+        g_gyroWindow.windowFull = true;
+    }
+    
+    g_gyroWindow.lastSampleTime = currentTime;
+}
+
