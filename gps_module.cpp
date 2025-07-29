@@ -17,6 +17,9 @@ void gps_init() {
     g_gpsPosition.altitude = 0.0f;
     g_gpsPosition.ns = 'N';
     g_gpsPosition.ew = 'E';
+    g_gpsPosition.satellites = 0;
+    g_gpsPosition.hdop = 0.0f;
+    g_gpsPosition.fixQuality = 0;
     g_gpsPosition.dataValid = false;
     g_gpsPosition.lastUpdateTime = 0;
     
@@ -156,12 +159,34 @@ int parse_gps_position(char *nmea_data, gps_position_t *pos) {
         return 1;  // 成功解析经纬度
     }
     
-    // 解析GPGGA/GNGGA语句获取海拔
+    // 解析GPGGA/GNGGA语句获取海拔、卫星数量和精度
     if(strstr(line, "$GPGGA") != NULL || strstr(line, "$GNGGA") != NULL) {
         // 检查GPS质量指示 (字段6)
         field_pos = find_comma_pos(line, 6);
-        if(field_pos > 0 && line[field_pos] == '0') {
-            return 0; // GPS质量指示为0，数据无效
+        if(field_pos > 0) {
+            sscanf(line + field_pos, "%[^,]", field_buf);
+            pos->fixQuality = atoi(field_buf);
+            if (pos->fixQuality == 0) {
+                return 0; // GPS质量指示为0，数据无效
+            }
+        }
+        
+        // 使用的卫星数量 (字段7)
+        field_pos = find_comma_pos(line, 7);
+        if(field_pos > 0) {
+            sscanf(line + field_pos, "%[^,]", field_buf);
+            if (strlen(field_buf) > 0) {
+                pos->satellites = atoi(field_buf);
+            }
+        }
+        
+        // 水平精度稀释值HDOP (字段8)
+        field_pos = find_comma_pos(line, 8);
+        if(field_pos > 0) {
+            sscanf(line + field_pos, "%[^,]", field_buf);
+            if (strlen(field_buf) > 0) {
+                pos->hdop = atof(field_buf);
+            }
         }
         
         // 海拔 (字段9)
@@ -173,7 +198,7 @@ int parse_gps_position(char *nmea_data, gps_position_t *pos) {
             }
         }
         
-        return 2;  // 成功解析海拔
+        return 2;  // 成功解析海拔和精度信息
     }
     
     return 0;  // 无关语句
@@ -184,10 +209,23 @@ int parse_gps_position(char *nmea_data, gps_position_t *pos) {
  */
 void gps_print_position() {
     if (g_gpsPosition.dataValid) {
-        Serial.printf("GPS位置: %.6f°%c, %.6f°%c, 海拔:%.1fm (更新时间:%lu)\n", 
+        Serial.printf("GPS位置: %.6f°%c, %.6f°%c, 海拔:%.1fm\n", 
                      g_gpsPosition.latitude, g_gpsPosition.ns,
                      g_gpsPosition.longitude, g_gpsPosition.ew,
-                     g_gpsPosition.altitude, g_gpsPosition.lastUpdateTime);
+                     g_gpsPosition.altitude);
+        
+        // 显示定位精度和卫星信息
+        Serial.printf("定位精度: %.1fm (%s), 使用卫星: %d颗\n",
+                     g_gpsPosition.hdop,
+                     (g_gpsPosition.hdop < 2.0) ? "优秀" : 
+                     (g_gpsPosition.hdop < 5.0) ? "良好" : "一般",
+                     g_gpsPosition.satellites);
+        
+        // 显示定位质量
+        const char* fixType[] = {"无效", "GPS", "DGPS", "PPS"};
+        Serial.printf("定位类型: %s, 更新时间: %lu\n",
+                     (g_gpsPosition.fixQuality < 4) ? fixType[g_gpsPosition.fixQuality] : "未知",
+                     g_gpsPosition.lastUpdateTime);
     } else {
         Serial.println("GPS数据无效或未收到数据");
         Serial.println("可能原因: 1)天线未连接 2)室内信号弱 3)等待定位中");

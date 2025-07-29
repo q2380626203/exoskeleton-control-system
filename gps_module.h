@@ -11,6 +11,9 @@ typedef struct {
     float altitude;    // 海拔 (米)
     char ns;           // 南北半球标识 ('N' or 'S')
     char ew;           // 东西半球标识 ('E' or 'W')
+    int satellites;    // 使用的卫星数量
+    float hdop;        // 水平精度稀释（定位精度）
+    int fixQuality;    // 定位质量 (0=无效, 1=GPS, 2=DGPS)
     bool dataValid;    // 数据有效性标志
     uint32_t lastUpdateTime; // 最后更新时间
 } gps_position_t;
