@@ -115,8 +115,8 @@ int parse_gps_position(char *nmea_data, gps_position_t *pos) {
     char field_buf[20];
     int field_pos;
     
-    // 解析GPRMC语句获取经纬度
-    if(strstr(line, "$GPRMC") != NULL) {
+    // 解析GPRMC/GNRMC语句获取经纬度
+    if(strstr(line, "$GPRMC") != NULL || strstr(line, "$GNRMC") != NULL) {
         // 检查数据状态 (字段2)
         field_pos = find_comma_pos(line, 2);
         if(field_pos > 0 && line[field_pos] != 'A') {
@@ -156,8 +156,8 @@ int parse_gps_position(char *nmea_data, gps_position_t *pos) {
         return 1;  // 成功解析经纬度
     }
     
-    // 解析GPGGA语句获取海拔
-    if(strstr(line, "$GPGGA") != NULL) {
+    // 解析GPGGA/GNGGA语句获取海拔
+    if(strstr(line, "$GPGGA") != NULL || strstr(line, "$GNGGA") != NULL) {
         // 检查GPS质量指示 (字段6)
         field_pos = find_comma_pos(line, 6);
         if(field_pos > 0 && line[field_pos] == '0') {
@@ -190,5 +190,6 @@ void gps_print_position() {
                      g_gpsPosition.altitude, g_gpsPosition.lastUpdateTime);
     } else {
         Serial.println("GPS数据无效或未收到数据");
+        Serial.println("可能原因: 1)天线未连接 2)室内信号弱 3)等待定位中");
     }
 }
