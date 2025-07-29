@@ -33,6 +33,7 @@ void gps_init() {
 void gps_update() {
     static char gpsBuffer[GPS_BUFFER_SIZE];
     static int bufferIndex = 0;
+    static unsigned long totalLinesProcessed = 0;
     
     // 读取GPS数据
     while (gpsSerial.available()) {
@@ -42,6 +43,7 @@ void gps_update() {
             // 一行数据结束
             if (bufferIndex > 0) {
                 gpsBuffer[bufferIndex] = '\0'; // 添加字符串结束符
+                totalLinesProcessed++;
                 
                 // 解析GPS数据
                 int parseResult = parse_gps_position(gpsBuffer, &g_gpsPosition);
@@ -227,7 +229,85 @@ void gps_print_position() {
                      (g_gpsPosition.fixQuality < 4) ? fixType[g_gpsPosition.fixQuality] : "未知",
                      g_gpsPosition.lastUpdateTime);
     } else {
-        Serial.println("GPS数据无效或未收到数据");
-        Serial.println("可能原因: 1)天线未连接 2)室内信号弱 3)等待定位中");
+        // 详细的无信号状态分析
+        Serial.println("=== GPS状态: 无有效定位信号 ===");
+        
+        // 检查数据超时情况
+        uint32_t timeSinceUpdate = millis() - g_gpsPosition.lastUpdateTime;
+        if (g_gpsPosition.lastUpdateTime == 0) {
+            Serial.println("状态: 从未收到GPS数据");
+            Serial.println("检查: 1) GPS模块是否连接到GPIO4");
+            Serial.println("     2) GPS模块是否正常供电(3.3V)");
+            Serial.println("     3) 波特率是否为9600");
+        } else if (timeSinceUpdate > 10000) {
+            Serial.printf("状态: GPS数据超时 (%lu秒前最后更新)\n", timeSinceUpdate/1000);
+            Serial.println("检查: 1) GPS模块连接是否松动");
+            Serial.println("     2) 软串口是否被其他任务占用");
+        } else {
+            Serial.printf("状态: 收到GPS数据但无有效定位 (%lu秒前更新)\n", timeSinceUpdate/1000);
+        }
+        
+        // 显示当前GPS状态信息
+        if (g_gpsPosition.satellites > 0) {
+            Serial.printf("当前状态: 搜索到%d颗卫星，但信号不足定位\n", g_gpsPosition.satellites);
+            Serial.println("建议: 移动到室外开阔区域，等待卫星信号稳定");
+        } else {
+            Serial.println("当前状态: 未搜索到任何卫星信号");
+            Serial.println("建议: 1) 移动到室外空旷区域");
+            Serial.println("     2) 检查天线连接(ANTENNA OPEN问题)");
+            Serial.println("     3) 等待冷启动完成(可能需要数分钟)");
+        }
+        
+        // 定位质量分析
+        if (g_gpsPosition.fixQuality == 0) {
+            Serial.println("定位质量: 无定位");
+        } else {
+            const char* fixType[] = {"无效", "GPS", "DGPS", "PPS"};
+            Serial.printf("定位质量: %s (但数据无效)\n", 
+                         (g_gpsPosition.fixQuality < 4) ? fixType[g_gpsPosition.fixQuality] : "未知");
+        }
+        
+        Serial.println("提示: GPS首次启动或长时间未使用需要较长时间获取卫星信息");
+        Serial.println("===============================");
+    }
+}
+
+/**
+ * 显示GPS模块状态和调试信息
+ */
+void gps_print_status() {
+    static unsigned long totalBytesReceived = 0;
+    static unsigned long totalLinesProcessed = 0;
+    static unsigned long lastStatusTime = 0;
+    
+    // 统计接收到的数据
+    while (gpsSerial.available()) {
+        gpsSerial.read();
+        totalBytesReceived++;
+    }
+    
+    if (millis() - lastStatusTime > 1000) { // 每秒更新一次
+        lastStatusTime = millis();
+        
+        Serial.println("=== GPS模块状态 ===");
+        Serial.printf("软串口: GPIO%d, %d bps\n", GPS_RX_PIN, GPS_BAUDRATE);
+        Serial.printf("接收统计: %lu字节, %lu行\n", totalBytesReceived, totalLinesProcessed);
+        
+        if (totalBytesReceived == 0) {
+            Serial.println("⚠️  未接收到任何数据");
+            Serial.println("检查: GPS模块连接、供电、波特率");
+        } else if (totalBytesReceived < 100) {
+            Serial.println("⚠️  接收数据量很少");
+            Serial.println("检查: GPS模块是否正常工作");
+        } else {
+            Serial.println("✅ GPS模块通信正常");
+            
+            if (g_gpsPosition.dataValid) {
+                Serial.println("✅ GPS定位成功");
+            } else {
+                Serial.println("⏳ GPS搜星中，等待定位...");
+            }
+        }
+        Serial.println("==================");
     }
 }

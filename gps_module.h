@@ -32,6 +32,7 @@ extern SoftwareSerial gpsSerial;
 void gps_init();
 void gps_update();
 bool gps_hasValidData();
+void gps_print_status();
 int find_comma_pos(char *buf, int cx);
 float convert_coordinate(char *coord_str);
 int parse_gps_position(char *nmea_data, gps_position_t *pos);
