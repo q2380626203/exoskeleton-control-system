@@ -605,24 +605,12 @@ void gyroUpdateTask(void* parameter) {
     TickType_t lastWakeTime = xTaskGetTickCount();
     const TickType_t frequency = pdMS_TO_TICKS(100); // 100ms
     
-    unsigned long lastPrintTime = 0;
-    const unsigned long printInterval = 1000; // 每秒打印一次数据
-    
     for (;;) {
         // 更新陀螺仪数据
         gy25t_update();
         
-        // 每秒打印一次陀螺仪数据用于调试
-        // unsigned long currentTime = millis();
-        // if (currentTime - lastPrintTime >= printInterval) {
-        //     if (g_gyroData.dataValid) {
-        //         Serial.printf("陀螺仪数据 - X:%d, Y:%d, Z:%d (时间:%lu)\n", 
-        //                       g_gyroData.x, g_gyroData.y, g_gyroData.z, g_gyroData.lastUpdateTime);
-        //     } else {
-        //         Serial.println("陀螺仪数据无效或未收到数据");
-        //     }
-        //     lastPrintTime = currentTime;
-        // }
+        // 每2秒打印一次调试数据
+        gy25t_printDebugData();
         
         vTaskDelayUntil(&lastWakeTime, frequency);
     }
@@ -768,9 +756,24 @@ void gpsUpdateTask(void* parameter) {
     TickType_t lastWakeTime = xTaskGetTickCount();
     const TickType_t frequency = pdMS_TO_TICKS(200); // 200ms更新频率
     
+    static uint32_t lastGpsPrintTime = 0;
+    const uint32_t GPS_PRINT_INTERVAL_MS = 3000; // 每3秒打印一次GPS数据
+    
     for (;;) {
         // 更新GPS数据
         gps_update();
+        
+        // 每3秒打印一次GPS状态和位置信息
+        uint32_t currentTime = millis();
+        if (currentTime - lastGpsPrintTime >= GPS_PRINT_INTERVAL_MS) {
+            lastGpsPrintTime = currentTime;
+            
+            Serial.println("======== GPS调试数据 ========");
+            gps_print_status();   // 打印GPS状态信息
+            gps_print_position(); // 打印GPS位置信息
+            Serial.println("===========================");
+            Serial.println();
+        }
         
         vTaskDelayUntil(&lastWakeTime, frequency);
     }

@@ -167,8 +167,8 @@ void handle_uart_rx() {
  * @param callback Function pointer for data updates.
  */
 void UART_Rx_Init(MotorDataCallback callback) {
-    motor_serial = &Serial1;
-    motor_serial->begin(115200, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
+    motor_serial = &MOTOR_SERIAL_PORT;
+    motor_serial->begin(UART_BAUDRATE, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
     
     // 设置更大的串口缓冲区以提高通信可靠性
     motor_serial->setRxBufferSize(1024);

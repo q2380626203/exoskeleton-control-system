@@ -7,9 +7,11 @@
 #include <HardwareSerial.h>
 #include <cmath>
 
-// UART Pin Configuration
-#define UART_TX_PIN      13
-#define UART_RX_PIN      12
+// UART Configuration
+#define MOTOR_SERIAL_PORT    Serial1    // Hardware serial port for RS01 motor communication
+#define UART_TX_PIN          13         // UART transmit pin  
+#define UART_RX_PIN          12         // UART receive pin  
+#define UART_BAUDRATE        115200     // UART baud rate
 
 // CAN-to-Serial Module Protocol
 #define CAN_RAW_FRAME_LENGTH 12 
