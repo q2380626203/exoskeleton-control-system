@@ -19,6 +19,7 @@
 #include "rs01_motor.h"
 #include "gy25t_sensor.h"
 #include "ble_manager.h"
+#include "gps_module.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 
@@ -61,6 +62,7 @@ TaskHandle_t uartTransmitManagerTaskHandle = NULL;
 TaskHandle_t analysisTaskHandle = NULL;
 TaskHandle_t standstillDetectionTaskHandle = NULL;
 TaskHandle_t gyroUpdateTaskHandle = NULL;
+TaskHandle_t gpsUpdateTaskHandle = NULL;
 
 // BLE管理器实例在ble_manager.cpp中定义
 
@@ -96,6 +98,7 @@ void uartTransmitManagerTask(void* parameter);
 void analysisTask(void* parameter);
 void standstillDetectionTask(void* parameter);
 void gyroUpdateTask(void* parameter);
+void gpsUpdateTask(void* parameter);
 void analyzeActivityAndSetTorque(MotorChannel& channel);
 void motorDataCallback(MI_Motor* updated_motor);
 float processStepwiseTorqueDecay(int motor_index, bool isActive, float startValue, uint32_t startTime, const char* source);
@@ -164,13 +167,17 @@ void setup() {
     
     // 初始化GY25T陀螺仪
     gy25t_init();
+    
+    // 初始化GPS模块
+    gps_init();
 
     // 首先创建UART和分析任务（提高电机通信任务优先级）
     xTaskCreatePinnedToCore(uartReceiveParseTask, "UartReceiveTask", 8192, NULL, 7, &uartReceiveParseTaskHandle, 1);  // 提高到7
     xTaskCreatePinnedToCore(uartTransmitManagerTask, "UartTransmitTask", 8192, NULL, 6, &uartTransmitManagerTaskHandle, 1);  // 提高到6
     xTaskCreatePinnedToCore(gyroUpdateTask, "GyroUpdateTask", 4096, NULL, 4, &gyroUpdateTaskHandle, 0);  // 提高到4
-    xTaskCreatePinnedToCore(analysisTask, "AnalysisTask", 8192, NULL, 3, &analysisTaskHandle, 0);  // 提高到3
-    xTaskCreatePinnedToCore(standstillDetectionTask, "StandstillDetectionTask", 4096, NULL, 2, &standstillDetectionTaskHandle, 0);  // 提高到2
+    xTaskCreatePinnedToCore(gpsUpdateTask, "GpsUpdateTask", 4096, NULL, 3, &gpsUpdateTaskHandle, 0);  // GPS任务优先级3
+    xTaskCreatePinnedToCore(analysisTask, "AnalysisTask", 8192, NULL, 2, &analysisTaskHandle, 0);  // 降低到2
+    xTaskCreatePinnedToCore(standstillDetectionTask, "StandstillDetectionTask", 4096, NULL, 1, &standstillDetectionTaskHandle, 0);  // 降低到1
     Serial.println("所有FreeRTOS任务已创建.");
     
     // 初始化电机模式为电流模式
@@ -598,24 +605,12 @@ void gyroUpdateTask(void* parameter) {
     TickType_t lastWakeTime = xTaskGetTickCount();
     const TickType_t frequency = pdMS_TO_TICKS(100); // 100ms
     
-    unsigned long lastPrintTime = 0;
-    const unsigned long printInterval = 1000; // 每秒打印一次数据
-    
     for (;;) {
         // 更新陀螺仪数据
         gy25t_update();
         
-        // 每秒打印一次陀螺仪数据用于调试
-        // unsigned long currentTime = millis();
-        // if (currentTime - lastPrintTime >= printInterval) {
-        //     if (g_gyroData.dataValid) {
-        //         Serial.printf("陀螺仪数据 - X:%d, Y:%d, Z:%d (时间:%lu)\n", 
-        //                       g_gyroData.x, g_gyroData.y, g_gyroData.z, g_gyroData.lastUpdateTime);
-        //     } else {
-        //         Serial.println("陀螺仪数据无效或未收到数据");
-        //     }
-        //     lastPrintTime = currentTime;
-        // }
+        // 每2秒打印一次调试数据
+        gy25t_printDebugData();
         
         vTaskDelayUntil(&lastWakeTime, frequency);
     }
@@ -753,5 +748,33 @@ void motorDataCallback(MI_Motor* updated_motor) {
         } else { 
             xSemaphoreGive(motor2DataReceivedSemaphore); 
         }
+    }
+}
+
+// ==================== GPS更新任务 ===================
+void gpsUpdateTask(void* parameter) {
+    TickType_t lastWakeTime = xTaskGetTickCount();
+    const TickType_t frequency = pdMS_TO_TICKS(200); // 200ms更新频率
+    
+    static uint32_t lastGpsPrintTime = 0;
+    const uint32_t GPS_PRINT_INTERVAL_MS = 3000; // 每3秒打印一次GPS数据
+    
+    for (;;) {
+        // 更新GPS数据
+        gps_update();
+        
+        // 每3秒打印一次GPS状态和位置信息
+        uint32_t currentTime = millis();
+        if (currentTime - lastGpsPrintTime >= GPS_PRINT_INTERVAL_MS) {
+            lastGpsPrintTime = currentTime;
+            
+            Serial.println("======== GPS调试数据 ========");
+            gps_print_status();   // 打印GPS状态信息
+            gps_print_position(); // 打印GPS位置信息
+            Serial.println("===========================");
+            Serial.println();
+        }
+        
+        vTaskDelayUntil(&lastWakeTime, frequency);
     }
 }

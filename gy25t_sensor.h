@@ -2,7 +2,7 @@
 #define GY25T_SENSOR_H
 
 #include <Arduino.h>
-#include <HardwareSerial.h>
+#include <SoftwareSerial.h>
 
 // GY25T数据包结构定义
 #define GY25T_FRAME_HEADER_1    0xA4
@@ -13,11 +13,10 @@
 #define GY25T_DATA_SIZE         6
 #define GY25T_CHECKSUM_SIZE     1
 
-// 串口配置
+// 软串口配置 - 使用TX1 RX2
 #define GY25T_BAUDRATE          115200
-#define GY25T_TX_PIN            11
-#define GY25T_RX_PIN            10
-#define GY25T_SERIAL_NUM        2  // 使用UART2，避免与电机UART1冲突
+#define GY25T_TX_PIN            1
+#define GY25T_RX_PIN            2
 
 // 陀螺仪原始数据结构
 struct GyroRawData {
@@ -33,6 +32,9 @@ struct GyroRawData {
 #define GYRO_SAMPLE_INTERVAL_MS 100
 #define GYRO_STANDSTILL_THRESHOLD 100
 
+// 调试打印配置
+#define GY25T_PRINT_INTERVAL_MS 2000  // 每2秒打印一次数据
+
 // 陀螺仪滑动窗口数据结构
 struct GyroWindowData {
     int16_t x_samples[GYRO_WINDOW_SIZE];
@@ -47,7 +49,7 @@ struct GyroWindowData {
 // 全局变量声明
 extern GyroRawData g_gyroData;
 extern GyroWindowData g_gyroWindow;
-extern HardwareSerial gy25tSerial;
+extern SoftwareSerial gy25tSerial;
 
 // 函数声明
 void gy25t_init();
@@ -56,5 +58,6 @@ bool gy25t_parsePacket(uint8_t* buffer, int length);
 uint8_t gy25t_calculateChecksum(uint8_t* data, int length);
 void gy25t_printData();
 void gy25t_updateWindow();
+void gy25t_printDebugData();  // 定时打印调试数据
 
 #endif // GY25T_SENSOR_H

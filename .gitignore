@@ -1,0 +1,25 @@
+# Claude Code 设置文件
+.claude/
+
+# Arduino IDE 生成的文件
+*.hex
+*.elf
+*.map
+
+# 编译生成的文件
+build/
+*.o
+*.a
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 临时文件
+*.tmp
+*.bak
+*~
+
+# IDE 文件
+.vscode/
+.idea/

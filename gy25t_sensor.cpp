@@ -3,15 +3,20 @@
 // 全局变量定义
 GyroRawData g_gyroData = {0, 0, 0, 0, false};
 GyroWindowData g_gyroWindow = {{0}, {0}, {0}, {0}, 0, false, 0};
-HardwareSerial gy25tSerial(GY25T_SERIAL_NUM); // 使用UART2
+SoftwareSerial gy25tSerial(GY25T_RX_PIN, GY25T_TX_PIN); // 使用软串口
 
 // 数据接收缓冲区
 static uint8_t rxBuffer[GY25T_PACKET_SIZE * 2]; // 双倍大小防止溢出
 static int bufferIndex = 0;
 
+// 调试打印相关变量
+static uint32_t lastPrintTime = 0;
+static uint8_t lastRawPacket[GY25T_PACKET_SIZE]; // 保存最后一个完整数据包
+static bool hasValidPacket = false;
+
 void gy25t_init() {
-    // 初始化串口
-    gy25tSerial.begin(GY25T_BAUDRATE, SERIAL_8N1, GY25T_RX_PIN, GY25T_TX_PIN);
+    // 初始化软串口
+    gy25tSerial.begin(GY25T_BAUDRATE);
     
     // 清空接收缓冲区
     while (gy25tSerial.available()) {
@@ -33,8 +38,8 @@ void gy25t_init() {
     
     bufferIndex = 0;
     
-    Serial.println("GY25T陀螺仪初始化完成");
-    Serial.printf("串口配置: 波特率=%d, RX引脚=%d, TX引脚=%d\n", 
+    Serial.println("GY25T陀螺仪初始化完成 - 使用软串口");
+    Serial.printf("软串口配置: 波特率=%d, RX引脚=%d, TX引脚=%d\n", 
                   GY25T_BAUDRATE, GY25T_RX_PIN, GY25T_TX_PIN);
 }
 
@@ -133,6 +138,10 @@ bool gy25t_parsePacket(uint8_t* buffer, int length) {
     g_gyroData.lastUpdateTime = millis();
     g_gyroData.dataValid = true;
     
+    // 保存原始数据包用于调试打印
+    memcpy(lastRawPacket, buffer, GY25T_PACKET_SIZE);
+    hasValidPacket = true;
+    
     // 更新滑动窗口
     gy25t_updateWindow();
     
@@ -182,5 +191,24 @@ void gy25t_updateWindow() {
     }
     
     g_gyroWindow.lastSampleTime = currentTime;
+}
+
+void gy25t_printDebugData() {
+    uint32_t currentTime = millis();
+    
+    // 检查是否到了打印时间（2秒间隔）
+    if (currentTime - lastPrintTime < GY25T_PRINT_INTERVAL_MS) {
+        return;
+    }
+    
+    lastPrintTime = currentTime;
+    
+    // 只打印解析后的数据
+    if (g_gyroData.dataValid) {
+        Serial.printf("GY25T解析数据 - X:%d, Y:%d, Z:%d\n", 
+                      g_gyroData.x, g_gyroData.y, g_gyroData.z);
+    } else {
+        Serial.println("GY25T解析数据: 无效");
+    }
 }
 
