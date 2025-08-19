@@ -19,7 +19,8 @@
 #include "rs01_motor.h"
 #include "gy25t_sensor.h"
 #include "ble_manager.h"
-#include "gps_module.h"
+// #include "gps_module.h"  // GPS模块已屏蔽
+#include "button_detector.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 
@@ -62,7 +63,7 @@ TaskHandle_t uartTransmitManagerTaskHandle = NULL;
 TaskHandle_t analysisTaskHandle = NULL;
 TaskHandle_t standstillDetectionTaskHandle = NULL;
 TaskHandle_t gyroUpdateTaskHandle = NULL;
-TaskHandle_t gpsUpdateTaskHandle = NULL;
+// TaskHandle_t gpsUpdateTaskHandle = NULL;  // GPS任务句柄已屏蔽
 
 // BLE管理器实例在ble_manager.cpp中定义
 
@@ -136,13 +137,18 @@ void setMotorTargetTorque(int motor_index, float torque) {
 void setup() {
     Serial.begin(115200);
     
-    // 上电后等待3秒，让电机驱动器和其他系统稳定启动
-    Serial.println("系统上电，等待3秒让所有子系统稳定...");
+    // 首先初始化BLE服务
+    Serial.println("优先初始化BLE服务...");
+    bleManager.init();
+    Serial.println("BLE服务初始化完成");
+    
+    // BLE初始化后等待3秒
+    Serial.println("BLE初始化后等待3秒，确保连接稳定...");
     for (int i = 3; i > 0; i--) {
-        Serial.printf("等待倒计时: %d秒\n", i);
+        Serial.printf("BLE稳定倒计时: %d秒\n", i);
         delay(1000);
     }
-    Serial.println("系统稳定，开始初始化...");
+    Serial.println("BLE连接稳定，开始初始化其他服务...");
     
     motorChannels[0].motor_obj.id = MOTER_1_ID;
     motorChannels[1].motor_obj.id = MOTER_2_ID;
@@ -168,16 +174,20 @@ void setup() {
     // 初始化GY25T陀螺仪
     gy25t_init();
     
+    // 初始化按键检测模块
+    button_init();
+    
     // 初始化GPS模块
-    gps_init();
+    // gps_init();  // GPS初始化已屏蔽
 
     // 首先创建UART和分析任务（提高电机通信任务优先级）
     xTaskCreatePinnedToCore(uartReceiveParseTask, "UartReceiveTask", 8192, NULL, 7, &uartReceiveParseTaskHandle, 1);  // 提高到7
     xTaskCreatePinnedToCore(uartTransmitManagerTask, "UartTransmitTask", 8192, NULL, 6, &uartTransmitManagerTaskHandle, 1);  // 提高到6
     xTaskCreatePinnedToCore(gyroUpdateTask, "GyroUpdateTask", 4096, NULL, 4, &gyroUpdateTaskHandle, 0);  // 提高到4
-    xTaskCreatePinnedToCore(gpsUpdateTask, "GpsUpdateTask", 4096, NULL, 3, &gpsUpdateTaskHandle, 0);  // GPS任务优先级3
+    // xTaskCreatePinnedToCore(gpsUpdateTask, "GpsUpdateTask", 4096, NULL, 3, &gpsUpdateTaskHandle, 0);  // GPS任务已屏蔽
     xTaskCreatePinnedToCore(analysisTask, "AnalysisTask", 8192, NULL, 2, &analysisTaskHandle, 0);  // 降低到2
     xTaskCreatePinnedToCore(standstillDetectionTask, "StandstillDetectionTask", 4096, NULL, 1, &standstillDetectionTaskHandle, 0);  // 降低到1
+    xTaskCreatePinnedToCore(buttonProcessTask, "ButtonProcessTask", 4096, NULL, 3, NULL, 0);  // 优先级3，运行在核心0
     Serial.println("所有FreeRTOS任务已创建.");
     
     // 初始化电机模式为电流模式
@@ -194,13 +204,12 @@ void setup() {
     // 设置初始化完成标志，允许uartTransmitManagerTask开始发送电流指令
     motorInitializationComplete = true;
     Serial.println("电机初始化完成，现在可以安全发送电流指令.");
-    
-    // 初始化BLE管理器
-    bleManager.init();
 }
 
 // 在loop函数中添加BLE管理
 void loop() {
+    // 按键检测现在使用中断方式，无需在loop中处理
+    
     // 添加BLE连接监控（不自动重启）
     static unsigned long lastForceSendTime = 0;
     
@@ -751,7 +760,8 @@ void motorDataCallback(MI_Motor* updated_motor) {
     }
 }
 
-// ==================== GPS更新任务 ===================
+// ==================== GPS更新任务 (已屏蔽) ===================
+/*
 void gpsUpdateTask(void* parameter) {
     TickType_t lastWakeTime = xTaskGetTickCount();
     const TickType_t frequency = pdMS_TO_TICKS(200); // 200ms更新频率
@@ -778,3 +788,4 @@ void gpsUpdateTask(void* parameter) {
         vTaskDelayUntil(&lastWakeTime, frequency);
     }
 }
+*/

@@ -15,8 +15,8 @@
 
 // 软串口配置 - 使用TX1 RX2
 #define GY25T_BAUDRATE          115200
-#define GY25T_TX_PIN            1
-#define GY25T_RX_PIN            2
+#define GY25T_TX_PIN            11
+#define GY25T_RX_PIN            10
 
 // 陀螺仪原始数据结构
 struct GyroRawData {
