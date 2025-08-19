@@ -3,6 +3,7 @@
 
 #include <Arduino.h>
 #include "ble_manager.h"
+#include "voice_module.h"
 
 // GPIO引脚配置
 #define BUTTON_GPIO1_PIN    1
@@ -32,6 +33,7 @@ void IRAM_ATTR button_gpio2_isr();
 
 // 外部变量声明
 extern AssistParameters assistParams;
+extern VoiceModule voiceModule;
 
 // 函数声明
 void button_init();

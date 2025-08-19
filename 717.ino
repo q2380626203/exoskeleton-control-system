@@ -21,6 +21,7 @@
 #include "ble_manager.h"
 // #include "gps_module.h"  // GPS模块已屏蔽
 #include "button_detector.h"
+#include "voice_module.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 
@@ -66,6 +67,7 @@ TaskHandle_t gyroUpdateTaskHandle = NULL;
 // TaskHandle_t gpsUpdateTaskHandle = NULL;  // GPS任务句柄已屏蔽
 
 // BLE管理器实例在ble_manager.cpp中定义
+VoiceModule voiceModule;
 
 // 初始化完成标志，确保模式设置完成后才开始发送电流指令
 volatile bool motorInitializationComplete = false;
@@ -177,6 +179,10 @@ void setup() {
     // 初始化按键检测模块
     button_init();
     
+    // 初始化语音模块
+    voiceModule.begin();
+    Serial.println("语音模块初始化完成");
+    
     // 初始化GPS模块
     // gps_init();  // GPS初始化已屏蔽
 
@@ -204,6 +210,22 @@ void setup() {
     // 设置初始化完成标志，允许uartTransmitManagerTask开始发送电流指令
     motorInitializationComplete = true;
     Serial.println("电机初始化完成，现在可以安全发送电流指令.");
+    
+    // 语音播报系统启动成功
+    voiceModule.speak("系统启动成功");
+    Serial.println("语音播报：系统启动成功");
+    
+    // 等待语音播报完成
+    delay(2000);
+    
+    // 使能电机并启动自动辅助
+    for (int i = 0; i < 2; i++) {
+        motorChannels[i].systemState = STATE_AUTO_ADAPT;
+        motorChannels[i].pending_web_cmd = CMD_ENABLE_MOTOR;
+        Serial.printf("电机 %d 设置为自动辅助模式并准备使能\n", motorChannels[i].motor_obj.id);
+    }
+    
+    
 }
 
 // 在loop函数中添加BLE管理

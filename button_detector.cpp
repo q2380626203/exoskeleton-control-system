@@ -56,6 +56,13 @@ void buttonProcessTask(void* pvParameters) {
             Serial.printf("按键1被按下 - 爬楼助力值增加: 普通=%.1f, 大幅=%.1f\n", 
                          assistParams.ASSIST_TORQUE_CLIMB, 
                          assistParams.ASSIST_TORQUE_CLIMB_STEEP);
+            
+            // 语音播报
+            voiceModule.speak("助力增加");
+            vTaskDelay(pdMS_TO_TICKS(2000)); // 等待语音播报完成
+            voiceModule.speak("当前助力");
+            vTaskDelay(pdMS_TO_TICKS(2000)); // 等待语音播报完成
+            voiceModule.speakChineseNumber((int)assistParams.ASSIST_TORQUE_CLIMB);
         }
         
         // 检查按键2状态位
@@ -73,6 +80,13 @@ void buttonProcessTask(void* pvParameters) {
             Serial.printf("按键2被按下 - 爬楼助力值减少: 普通=%.1f, 大幅=%.1f\n", 
                          assistParams.ASSIST_TORQUE_CLIMB, 
                          assistParams.ASSIST_TORQUE_CLIMB_STEEP);
+            
+            // 语音播报
+            voiceModule.speak("助力减少");
+            vTaskDelay(pdMS_TO_TICKS(2000)); // 等待语音播报完成
+            voiceModule.speak("当前助力");
+            vTaskDelay(pdMS_TO_TICKS(2000)); // 等待语音播报完成
+            voiceModule.speakChineseNumber((int)assistParams.ASSIST_TORQUE_CLIMB);
         }
         
         // 任务延时，避免过度占用CPU
